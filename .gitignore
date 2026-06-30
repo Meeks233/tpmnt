@@ -13,6 +13,10 @@ tpmnt-plan.md
 /scratch/
 /.scratch/
 
+# Local-only: dev scripts and agent guidance (not for distribution)
+/scripts/
+/CLAUDE.md
+
 # Editor / OS cruft
 .idea/
 .vscode/
