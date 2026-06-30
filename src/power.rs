@@ -95,11 +95,21 @@ fn is_removable(phys: &str) -> bool {
 
 /// Pick the concrete power-down action for `auto`, given the device's traits.
 fn resolve_method(method: PowerOffMethod, phys: &str) -> PowerOffMethod {
+    resolve_method_traits(method, is_removable(phys), is_rotational(phys))
+}
+
+/// Pure trait-to-action mapping, split out so it is testable without touching
+/// `/sys/block` (which is host-specific and non-hermetic under CI).
+fn resolve_method_traits(
+    method: PowerOffMethod,
+    removable: bool,
+    rotational: bool,
+) -> PowerOffMethod {
     match method {
         PowerOffMethod::Auto => {
-            if is_removable(phys) {
+            if removable {
                 PowerOffMethod::PowerOff
-            } else if is_rotational(phys) {
+            } else if rotational {
                 PowerOffMethod::Standby
             } else {
                 PowerOffMethod::Auto // sentinel: nothing applicable
@@ -445,11 +455,15 @@ mod tests {
     }
 
     #[test]
-    fn auto_method_on_non_rotational_non_removable_is_sentinel() {
-        // loop0 is neither removable nor rotational => Auto sentinel (skip).
-        assert_eq!(
-            resolve_method(PowerOffMethod::Auto, "/dev/loop0"),
-            PowerOffMethod::Auto
-        );
+    fn auto_method_maps_traits_to_action() {
+        use PowerOffMethod::*;
+        // Neither removable nor rotational (e.g. an SSD/loop) => sentinel: skip.
+        assert_eq!(resolve_method_traits(Auto, false, false), Auto);
+        // Rotational HDD => spin the platters down.
+        assert_eq!(resolve_method_traits(Auto, false, true), Standby);
+        // Removable (USB) => cut power; takes precedence over rotational.
+        assert_eq!(resolve_method_traits(Auto, true, true), PowerOff);
+        // An explicit method is always honored verbatim.
+        assert_eq!(resolve_method_traits(Standby, false, false), Standby);
     }
 }

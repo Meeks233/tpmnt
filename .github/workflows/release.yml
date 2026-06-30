@@ -1,7 +1,11 @@
-name: Release
+name: Build & Publish
 
+# Channels:
+#   * Every push to master/main  -> rolling PRE-RELEASE (tag `edge`).
+#   * A pushed version tag `v*`  -> stable RELEASE (that tag).
 on:
   push:
+    branches: [master, main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -12,41 +16,78 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Cross-platform static binaries. tpmnt runs on Linux, but the binary is built
-  # for the common Linux ABIs/arches a user might deploy to (incl. musl static).
+  # Decide which channel this run publishes to.
+  channel:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.c.outputs.tag }}
+      name: ${{ steps.c.outputs.name }}
+      prerelease: ${{ steps.c.outputs.prerelease }}
+    steps:
+      - id: c
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            {
+              echo "tag=$REF_NAME"
+              echo "name=tpmnt $REF_NAME"
+              echo "prerelease=false"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "tag=edge"
+              echo "name=tpmnt edge (rolling pre-release)"
+              echo "prerelease=true"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+  # Cross-compiled static binaries for the Linux ABIs/arches users deploy to.
   binaries:
-    name: binary (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
+    needs: channel
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
         with:
           toolchain: stable
-      # Builds, cross-compiles (via `cross` when needed), archives, and uploads
-      # the binary to the GitHub Release for the pushed tag.
-      - uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          bin: tpmnt
-          target: ${{ matrix.target }}
-          archive: tpmnt-$tag-$target
-          include: README.md,LICENSE-MIT,LICENSE-APACHE,man/tpmnt.1
-          token: ${{ secrets.GITHUB_TOKEN }}
+          key: ${{ matrix.target }}
+      - uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2
+        with:
+          tool: cross
+      - name: Build
+        run: cross build --release --locked --target ${{ matrix.target }}
+      - name: Archive
+        env:
+          TARGET: ${{ matrix.target }}
+          REF_TAG: ${{ needs.channel.outputs.tag }}
+        run: |
+          stage="tpmnt-${REF_TAG}-${TARGET}"
+          mkdir "$stage"
+          cp "target/${TARGET}/release/tpmnt" "$stage/"
+          cp README.md LICENSE-MIT LICENSE-APACHE man/tpmnt.1 "$stage/"
+          tar czf "${stage}.tar.gz" "$stage"
+          sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: tpmnt-*.tar.gz*
+          if-no-files-found: error
 
-  # Debian package for the path toward distro repos.
+  # Debian packages for the path toward distro repos.
   deb:
-    name: .deb (${{ matrix.target }})
+    needs: channel
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -58,7 +99,10 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
-      - name: Install cross-linker for aarch64
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: deb-${{ matrix.target }}
+      - name: Install aarch64 cross-linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
@@ -68,12 +112,34 @@ jobs:
             echo '[target.aarch64-unknown-linux-gnu]'
             echo 'linker = "aarch64-linux-gnu-gcc"'
           } >> .cargo/config.toml
-      - name: Install cargo-deb
-        run: cargo install cargo-deb --locked
+      - uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2
+        with:
+          tool: cargo-deb
       - name: Build .deb
-        run: cargo deb --target ${{ matrix.target }} --output "tpmnt-${{ matrix.target }}.deb"
-      - name: Upload .deb to release
-        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo deb --target "$TARGET" --output "tpmnt-${TARGET}.deb"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: deb-${{ matrix.target }}
+          path: tpmnt-*.deb
+          if-no-files-found: error
+
+  publish:
+    needs: [channel, binaries, deb]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish to ${{ needs.channel.outputs.tag }}
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: tpmnt-${{ matrix.target }}.deb
+          tag_name: ${{ needs.channel.outputs.tag }}
+          name: ${{ needs.channel.outputs.name }}
+          prerelease: ${{ needs.channel.outputs.prerelease }}
+          # Pre-releases should never become the "Latest" pointer.
+          make_latest: ${{ needs.channel.outputs.prerelease == 'false' }}
+          # Replace assets each run so the rolling `edge` release stays clean.
+          files: dist/**
