@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::cli::{MonitorArgs, PowerArgs};
+use serde_json::json;
+
+use crate::cli::{MonitorArgs, PowerArgs, ScheduleArgs};
 use crate::error::{err, Code, Result};
 use crate::power;
 
@@ -28,6 +30,52 @@ fn find_disk<'a>(ctx: &'a Context, name: &str) -> Result<&'a crate::config::Disk
 pub fn run(ctx: &Context, args: &PowerArgs) -> Result<Value> {
     let disk = find_disk(ctx, &args.name)?;
     power::spindown(ctx, disk)
+}
+
+/// Select the disks a `schedule` run applies to: the named ones, or every disk
+/// that has a `[disk.schedule]` when no names are given.
+fn schedule_disks<'a>(ctx: &'a Context, names: &[String]) -> Result<Vec<&'a crate::config::Disk>> {
+    if names.is_empty() {
+        return Ok(ctx
+            .config
+            .disks
+            .iter()
+            .filter(|d| d.schedule.is_some())
+            .collect());
+    }
+    names.iter().map(|n| find_disk(ctx, n)).collect()
+}
+
+/// Apply on/off schedules. `--once` runs a single tick across the selected disks
+/// (used by tests and ad-hoc runs); otherwise it loops like the systemd unit,
+/// re-evaluating every 30s so a busy disk is re-checked as its grace elapses.
+pub fn schedule(ctx: &Context, args: &ScheduleArgs) -> Result<Value> {
+    let disks = schedule_disks(ctx, &args.names)?;
+    if disks.is_empty() {
+        return err(
+            Code::EConfig,
+            "no scheduled disks; add a [disk.schedule] block or name a disk".to_string(),
+        );
+    }
+
+    let tz = args.timezone.as_deref();
+    if args.once {
+        let ticks: Vec<Value> = disks
+            .iter()
+            .map(|d| power::schedule_tick(ctx, d, tz))
+            .collect::<Result<_>>()?;
+        return Ok(json!({"ok": true, "action": "schedule", "disks": ticks}));
+    }
+
+    loop {
+        for d in &disks {
+            let tick = power::schedule_tick(ctx, d, tz)?;
+            if ctx.global.debug {
+                eprintln!("{tick}");
+            }
+        }
+        sleep(Duration::from_secs(30));
+    }
 }
 
 /// Idle watcher. `--once` does a single tick (deterministic, for the self-test);

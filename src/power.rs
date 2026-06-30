@@ -151,9 +151,34 @@ pub fn is_powered(disk: &Disk) -> bool {
     Path::new(&format!("/dev/mapper/{}", disk.mapper_name())).exists()
 }
 
+/// Outcome of an attempt to bring a disk down.
+enum SpinOutcome {
+    /// Disk powered off; carries the full result JSON.
+    Down(Value),
+    /// The disk is in use and a *clean* unmount/stop failed. No force (`-f`/`-l`)
+    /// was applied, so nothing in flight was interrupted. Carries steps so far.
+    Busy(Vec<Value>),
+}
+
 /// Spin the whole disk down: unmount -> close mapping -> power off the platters.
-/// Every mutating step goes through the Runner so --dry-run/--plan/--debug work.
+/// Errors if the disk is busy (a clean unmount is impossible) rather than
+/// forcing it — `tpmnt schedule` uses the soft path that defers instead.
 pub fn spindown(ctx: &Context, disk: &Disk) -> Result<Value> {
+    match spindown_impl(ctx, disk, false)? {
+        SpinOutcome::Down(v) => Ok(v),
+        SpinOutcome::Busy(_) => Err(Error::new(
+            Code::EPowerOff,
+            format!("disk '{}' is in use; refusing to force-unmount", disk.name),
+        )
+        .with_hint("retry once the mountpoint is idle, or stop the processes using it")),
+    }
+}
+
+/// Shared teardown. When `soft`, a busy clean-unmount returns `Busy` (caller
+/// decides whether to wait/defer) instead of failing — so data transfer in
+/// flight is never interrupted. Every mutating step goes through the Runner so
+/// --dry-run/--plan/--debug work.
+fn spindown_impl(ctx: &Context, disk: &Disk, soft: bool) -> Result<SpinOutcome> {
     let dry = ctx.global.effective_dry_run();
     let mapper = disk.mapper_name();
     let mapper_dev = format!("/dev/mapper/{mapper}");
@@ -162,14 +187,18 @@ pub fn spindown(ctx: &Context, disk: &Disk) -> Result<Value> {
 
     match disk.teardown {
         Teardown::Direct => {
-            // 1. unmount if mounted.
+            // 1. unmount if mounted (never `-f`/`-l`: a busy fs just fails cleanly).
             if is_mounted(&mp) {
-                ctx.runner
-                    .run(
-                        &["umount", &mp],
-                        "unmount cold-standby disk before spindown",
-                    )?
-                    .require("umount")?;
+                let out = ctx
+                    .runner
+                    .run(&["umount", &mp], "unmount disk before spindown")?;
+                if !out.ok() {
+                    if soft {
+                        steps.push(json!({"step": "umount", "target": mp, "busy": true, "stderr": out.stderr.trim()}));
+                        return Ok(SpinOutcome::Busy(steps));
+                    }
+                    out.require("umount")?;
+                }
                 steps.push(json!({"step": "umount", "target": mp}));
             } else {
                 steps.push(json!({"step": "umount", "target": mp, "skipped": "not mounted"}));
@@ -188,14 +217,20 @@ pub fn spindown(ctx: &Context, disk: &Disk) -> Result<Value> {
             }
         }
         Teardown::Systemd => {
-            // 1. stop the .mount unit (clean unmount; an automount re-arms).
+            // 1. stop the .mount unit (clean unmount; an automount re-arms). A
+            //    busy mount makes the stop job fail -> treat as Busy under soft.
             let mount_unit = unit_name_for(&disk.mountpoint);
-            ctx.runner
-                .run(
-                    &["systemctl", "stop", &mount_unit],
-                    "stop systemd mount unit before spindown",
-                )?
-                .require("systemctl stop mount")?;
+            let out = ctx.runner.run(
+                &["systemctl", "stop", &mount_unit],
+                "stop systemd mount unit before spindown",
+            )?;
+            if !out.ok() {
+                if soft {
+                    steps.push(json!({"step": "systemctl-stop-mount", "unit": mount_unit, "busy": true, "stderr": out.stderr.trim()}));
+                    return Ok(SpinOutcome::Busy(steps));
+                }
+                out.require("systemctl stop mount")?;
+            }
             steps.push(json!({"step": "systemctl-stop-mount", "unit": mount_unit}));
 
             // 2. stop systemd-cryptsetup@<mapper> so the next access re-opens it
@@ -259,12 +294,82 @@ pub fn spindown(ctx: &Context, disk: &Disk) -> Result<Value> {
         let _ = std::fs::remove_file(ctx.paths.monitor_state(&disk.name));
     }
 
-    Ok(json!({
+    Ok(SpinOutcome::Down(json!({
         "ok": true,
         "action": "power-off",
         "name": disk.name,
         "method_used": method_used,
         "skip_reason": skip_reason,
+        "dry_run": dry,
+        "steps": steps,
+    })))
+}
+
+/// Bring a scheduled disk up: open (TPM2 token) + mount, mirroring the disk's
+/// teardown mode so the pairing is symmetric. Idempotent — already-open /
+/// already-mounted steps are skipped.
+pub fn spinup(ctx: &Context, disk: &Disk) -> Result<Value> {
+    let dry = ctx.global.effective_dry_run();
+    let mapper = disk.mapper_name();
+    let mapper_dev = format!("/dev/mapper/{mapper}");
+    let container = disk.device_path();
+    let mp = disk.mountpoint.to_string_lossy().to_string();
+    let mut steps: Vec<Value> = Vec::new();
+
+    match disk.teardown {
+        Teardown::Direct => {
+            if Path::new(&mapper_dev).exists() && !dry {
+                steps.push(
+                    json!({"step": "cryptsetup-open", "mapper": mapper, "skipped": "already open"}),
+                );
+            } else {
+                // `cryptsetup open` auto-tries enrolled tokens (TPM2) — no prompt.
+                ctx.runner
+                    .run(
+                        &["cryptsetup", "open", &container, &mapper],
+                        "open LUKS mapping via TPM2 token",
+                    )?
+                    .require("cryptsetup open")?;
+                steps.push(json!({"step": "cryptsetup-open", "mapper": mapper}));
+            }
+
+            if is_mounted(&mp) && !dry {
+                steps.push(json!({"step": "mount", "target": mp, "skipped": "already mounted"}));
+            } else {
+                if !dry {
+                    let _ = std::fs::create_dir_all(&disk.mountpoint);
+                }
+                ctx.runner
+                    .run(&["mount", &mp], "mount disk")?
+                    .require("mount")?;
+                steps.push(json!({"step": "mount", "target": mp}));
+            }
+        }
+        Teardown::Systemd => {
+            let cs_unit = format!("systemd-cryptsetup@{}.service", systemd_escape(&mapper));
+            ctx.runner
+                .run(
+                    &["systemctl", "start", &cs_unit],
+                    "start systemd-cryptsetup unit (TPM2)",
+                )?
+                .require("systemctl start cryptsetup")?;
+            steps.push(json!({"step": "systemctl-start-cryptsetup", "unit": cs_unit}));
+
+            let mount_unit = unit_name_for(&disk.mountpoint);
+            ctx.runner
+                .run(
+                    &["systemctl", "start", &mount_unit],
+                    "start systemd mount unit",
+                )?
+                .require("systemctl start mount")?;
+            steps.push(json!({"step": "systemctl-start-mount", "unit": mount_unit}));
+        }
+    }
+
+    Ok(json!({
+        "ok": true,
+        "action": "power-on",
+        "name": disk.name,
         "dry_run": dry,
         "steps": steps,
     }))
@@ -361,6 +466,223 @@ pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
     }))
 }
 
+/// Persisted state for a disk's scheduled power-off grace period.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ScheduleState {
+    /// Epoch when the busy-grace expires (0 = no power-off pending yet).
+    off_deadline: u64,
+    /// True once we gave up forcing this off-cycle (data-safety deferral). Reset
+    /// the moment the disk re-enters its on-window.
+    deferred: bool,
+}
+
+fn load_sched(path: &Path) -> ScheduleState {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_sched(path: &Path, st: &ScheduleState) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(s) = serde_json::to_string(st) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
+/// Resolve a timezone to its current UTC offset (seconds east of UTC). A fixed
+/// offset ("+08:00") is parsed directly; a named zone ("Asia/Shanghai") or the
+/// system default is resolved via `date +%z` (delegating to the host tzdata,
+/// rather than bundling a tz database).
+fn resolve_offset_secs(ctx: &Context, tz: Option<&str>) -> Result<i64> {
+    if let Some(t) = tz {
+        if let Some(o) = crate::config::parse_utc_offset(t) {
+            return Ok(o);
+        }
+    }
+    let out = match tz {
+        Some(name) => ctx.runner.probe(
+            &["env", &format!("TZ={name}"), "date", "+%z"],
+            "resolve timezone offset",
+        )?,
+        None => ctx
+            .runner
+            .probe(&["date", "+%z"], "resolve local timezone offset")?,
+    };
+    let z = out.stdout.trim();
+    crate::config::parse_utc_offset(z).ok_or_else(|| {
+        Error::new(
+            Code::EConfig,
+            format!("could not resolve timezone offset (date returned '{z}')"),
+        )
+        .with_hint("use a fixed offset like \"+08:00\" or a valid IANA zone name")
+    })
+}
+
+/// One schedule tick for a disk: power it up inside its on-window, and down
+/// outside it. Power-off is data-safety gated — a busy disk is never force
+/// unmounted; instead we wait `grace` (10% of the on-window) for the transfer
+/// to finish, then defer (leave the disk up) rather than interrupt it.
+/// Idempotent and safe to call repeatedly.
+pub fn schedule_tick(ctx: &Context, disk: &Disk, tz_override: Option<&str>) -> Result<Value> {
+    let sched = match &disk.schedule {
+        Some(s) => s,
+        None => {
+            return Ok(json!({
+                "ok": true, "action": "skip", "name": disk.name,
+                "reason": "no schedule configured",
+            }));
+        }
+    };
+
+    let dry = ctx.global.effective_dry_run();
+    let tz = tz_override.or(sched.timezone.as_deref());
+    let offset = resolve_offset_secs(ctx, tz)?;
+    let now = now_epoch();
+    let tod = (now as i64 + offset).rem_euclid(86_400) as u32;
+    let in_window = sched.contains(tod);
+    let powered = is_powered(disk);
+    let state_path = ctx.paths.schedule_state(&disk.name);
+    let clock = json!({"tod_secs": tod, "offset_secs": offset, "in_window": in_window});
+
+    // -- Inside the on-window: ensure the disk is up; cancel any pending off. ---
+    if in_window {
+        if !dry {
+            let _ = std::fs::remove_file(&state_path);
+        }
+        if powered {
+            return Ok(json!({
+                "ok": true, "action": "up", "name": disk.name, "clock": clock,
+                "reason": "in window, already powered",
+            }));
+        }
+        let up = spinup(ctx, disk)?;
+        return Ok(json!({
+            "ok": true, "action": "power-on", "name": disk.name, "clock": clock,
+            "spinup": up,
+        }));
+    }
+
+    // -- Outside the window: bring the disk down, but never break transfers. ----
+    if !powered {
+        if !dry {
+            let _ = std::fs::remove_file(&state_path);
+        }
+        return Ok(json!({
+            "ok": true, "action": "down", "name": disk.name, "clock": clock,
+            "reason": "out of window, already powered down",
+        }));
+    }
+
+    let mut st = load_sched(&state_path);
+    if st.deferred {
+        // Already gave up forcing this cycle (user kept using it / squatter).
+        return Ok(json!({
+            "ok": true, "action": "deferred", "name": disk.name, "clock": clock,
+            "reason": "in use past grace; not forcing power-off (data-safety)",
+        }));
+    }
+
+    match spindown_impl(ctx, disk, true)? {
+        SpinOutcome::Down(sd) => {
+            if !dry {
+                let _ = std::fs::remove_file(&state_path);
+            }
+            Ok(json!({
+                "ok": true, "action": "power-off", "name": disk.name, "clock": clock,
+                "spindown": sd,
+            }))
+        }
+        SpinOutcome::Busy(steps) => {
+            let grace = sched.grace_secs();
+            if st.off_deadline == 0 {
+                st.off_deadline = now + grace;
+            }
+            let remaining = st.off_deadline.saturating_sub(now);
+            if now >= st.off_deadline {
+                st.deferred = true;
+                if !dry {
+                    save_sched(&state_path, &st);
+                }
+                Ok(json!({
+                    "ok": true, "action": "deferred", "name": disk.name, "clock": clock,
+                    "grace_secs": grace, "busy_steps": steps,
+                    "reason": "still in use after grace; deferring power-off (data-safety)",
+                }))
+            } else {
+                if !dry {
+                    save_sched(&state_path, &st);
+                }
+                Ok(json!({
+                    "ok": true, "action": "grace-wait", "name": disk.name, "clock": clock,
+                    "grace_secs": grace, "grace_remaining_secs": remaining, "busy_steps": steps,
+                    "reason": "disk busy; waiting for transfer to finish before power-off",
+                }))
+            }
+        }
+    }
+}
+
+/// Reconcile the systemd scheduler unit for a disk: write it when a schedule is
+/// configured, remove it otherwise. Mirrors `reconcile_monitor_unit`.
+pub fn reconcile_schedule_unit(
+    ctx: &Context,
+    unit_dir: &Path,
+    disk: &Disk,
+    dry: bool,
+) -> Result<FileChange> {
+    let unit_name = format!("tpmnt-schedule-{}.service", disk.name);
+    let path = unit_dir.join(&unit_name);
+
+    if disk.schedule.is_none() {
+        let action = if path.exists() {
+            if !dry {
+                let _ = std::fs::remove_file(&path);
+            }
+            "remove"
+        } else {
+            "noop"
+        };
+        return Ok(FileChange {
+            path: path.display().to_string(),
+            action,
+            line: unit_name,
+        });
+    }
+
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "tpmnt".to_string());
+    let cfg = ctx.global.config.display();
+    let content = format!(
+        "# tpmnt:{name}\n[Unit]\nDescription=tpmnt scheduled power on/off for {name}\nAfter=local-fs.target\n\n[Service]\nType=simple\nExecStart={exe} --config {cfg} schedule {name}\nRestart=always\nRestartSec=30\n\n[Install]\nWantedBy=multi-user.target\n",
+        name = disk.name,
+    );
+
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let action = if existing.is_empty() {
+        "create"
+    } else if existing != content {
+        "update"
+    } else {
+        "noop"
+    };
+    if action != "noop" && !dry {
+        std::fs::create_dir_all(unit_dir)
+            .map_err(|e| Error::new(Code::EInternal, format!("mkdir unit dir: {e}")))?;
+        std::fs::write(&path, &content)
+            .map_err(|e| Error::new(Code::EInternal, format!("write schedule unit: {e}")))?;
+    }
+    Ok(FileChange {
+        path: path.display().to_string(),
+        action,
+        line: unit_name,
+    })
+}
+
 /// Reconcile the systemd idle-monitor unit for a disk: write it for
 /// cold-standby disks, remove it for always-on. Mirrors `reconcile`'s tagging.
 pub fn reconcile_monitor_unit(
@@ -452,6 +774,27 @@ mod tests {
             "luks\\x2de7e6fc65\\x2dd99a"
         );
         assert_eq!(systemd_escape("tpmnt_data"), "tpmnt_data");
+    }
+
+    #[test]
+    fn schedule_state_round_trips() {
+        let dir = std::env::temp_dir().join(format!("tpmnt-sched-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("d.json");
+        // A missing file loads as the zero default (no pending off).
+        assert_eq!(load_sched(&f).off_deadline, 0);
+        assert!(!load_sched(&f).deferred);
+        save_sched(
+            &f,
+            &ScheduleState {
+                off_deadline: 123,
+                deferred: true,
+            },
+        );
+        let st = load_sched(&f);
+        assert_eq!(st.off_deadline, 123);
+        assert!(st.deferred);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

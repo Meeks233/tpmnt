@@ -216,6 +216,43 @@ window. On expiry it runs the spindown sequence: **unmount → `cryptsetup close
 backing disk** (`auto` picks `udisksctl power-off` for USB/removable, `hdparm -y` for rotational,
 and skips non-spinnable devices). `default` is `always-on`, so existing configs are unchanged.
 
+## Scheduled power on/off (time windows)
+
+Where *cold-standby* reacts to **idleness**, a **schedule** reacts to the **clock**: a disk is kept
+powered on during a daily window and powered off outside it. Add a `[disk.schedule]` to any disk:
+
+```toml
+[[disk]]
+name       = "archive"
+uuid       = "…"
+mountpoint = "/mnt/archive"
+
+[disk.schedule]
+on       = "08:00"          # power on at 08:00
+off      = "23:00"          # power off at 23:00 (off < on ⇒ overnight window)
+timezone = "Asia/Shanghai"  # fixed offset ("+08:00") or IANA name; omit = host local time
+```
+
+```sh
+sudo tpmnt apply                                   # installs tpmnt-schedule-archive.service
+sudo systemctl enable --now tpmnt-schedule-archive.service
+sudo tpmnt schedule archive backup --once          # apply one or several disks right now
+sudo tpmnt schedule --once --timezone "+08:00"      # all scheduled disks; override the zone
+```
+
+Each tick computes the current wall-clock time in the chosen zone (named zones are resolved through
+the **system tzdata**, no bundled database) and acts:
+
+- **inside the window** → power the disk **up** (`cryptsetup open` via TPM2 → mount), idempotently.
+- **outside the window** → power it **down** via the same data-safe sequence as `power`.
+
+**Power-off never breaks data transfer.** It only ever does a *clean* unmount — never `-f`/`-l`. If
+the disk is busy (an in-flight copy, a process holding the mount), tpmnt waits a **grace of 10% of
+the on-window**, re-checking each tick. If the transfer finishes within the grace, it powers off
+then; if the grace elapses and the disk is *still* in use — or the next on-window has begun, or the
+disk was brought up manually — tpmnt **defers** (leaves it up) rather than forcing it off, until the
+next cycle.
+
 ## AI-native interface
 
 Every command supports:
@@ -249,6 +286,7 @@ sudo tpmnt apply --plan
 | `tpmnt mount-remote <name>` | Mount a remote decrypted dir over sshfs via a self-healing systemd --user unit, with optional ProxyJump bastions. |
 | `tpmnt umount-remote <name>` | Stop+disable the unit and unmount. |
 | `tpmnt power <name>` | Spin a disk down now: unmount → `cryptsetup close` → power off the backing disk. |
+| `tpmnt schedule <name…>` | Apply a disk's daily on/off window now: power **up** inside it, **down** outside. Never force-unmounts a busy disk (waits 10% of the window, then defers). `--timezone` overrides the configured zone; `--once` does a single tick. |
 | `tpmnt print-config` | Emit the equivalent TOML for reproducible re-apply. |
 
 ### What "migrate" actually migrates

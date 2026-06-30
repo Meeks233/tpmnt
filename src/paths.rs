@@ -46,4 +46,10 @@ impl Paths {
         self.at("var/lib/tpmnt/monitor")
             .join(format!("{name}.json"))
     }
+
+    /// Per-disk schedule state (pending power-off grace deadline / deferral).
+    pub fn schedule_state(&self, name: &str) -> PathBuf {
+        self.at("var/lib/tpmnt/schedule")
+            .join(format!("{name}.json"))
+    }
 }

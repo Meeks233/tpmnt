@@ -96,6 +96,105 @@ pub struct Disk {
     /// (crypttab/fstab/automount) disk re-opens cleanly via TPM2 on next access.
     #[serde(default)]
     pub teardown: Teardown,
+    /// Optional daily on/off schedule. When set, `tpmnt schedule <name>` powers
+    /// the disk up inside the window and down outside it (data-safety gated).
+    #[serde(default)]
+    pub schedule: Option<Schedule>,
+}
+
+/// A daily wall-clock window during which a disk should be powered on. Outside
+/// the window `tpmnt schedule` tries to power the disk down, but never forces a
+/// busy disk off (it waits a grace, then defers) so data transfer is preserved.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Schedule {
+    /// Local time the disk should power on, "HH:MM" (24-hour).
+    pub on: String,
+    /// Local time the disk should power off, "HH:MM" (24-hour). An `off` earlier
+    /// than `on` denotes an overnight window (e.g. on=20:00, off=06:00).
+    pub off: String,
+    /// Timezone for `on`/`off`: a fixed UTC offset ("+08:00", "-0530", "Z") or an
+    /// IANA name ("Asia/Shanghai") resolved via the system tzdata. Unset = the
+    /// host's local time.
+    #[serde(default)]
+    pub timezone: Option<String>,
+}
+
+impl Schedule {
+    fn on_secs(&self) -> u32 {
+        parse_hm(&self.on).unwrap_or(0)
+    }
+    fn off_secs(&self) -> u32 {
+        parse_hm(&self.off).unwrap_or(0)
+    }
+
+    /// Whether a second-of-day (0..86400) falls inside the on-window. Equal
+    /// on/off means a 24h window (always on; never schedule-off).
+    pub fn contains(&self, tod: u32) -> bool {
+        let (on, off) = (self.on_secs(), self.off_secs());
+        if on == off {
+            true
+        } else if on < off {
+            tod >= on && tod < off
+        } else {
+            tod >= on || tod < off
+        }
+    }
+
+    /// Total length of the on-window in seconds (the "总开机时间").
+    pub fn on_window_secs(&self) -> u32 {
+        let (on, off) = (self.on_secs(), self.off_secs());
+        if on == off {
+            86_400
+        } else if off > on {
+            off - on
+        } else {
+            86_400 - (on - off)
+        }
+    }
+
+    /// Grace to wait for a busy disk before deferring power-off: 10% of the
+    /// on-window.
+    pub fn grace_secs(&self) -> u64 {
+        (self.on_window_secs() as u64) / 10
+    }
+}
+
+/// Parse a "HH:MM" (or "H:MM") 24-hour time into seconds-of-day. None if malformed.
+pub fn parse_hm(s: &str) -> Option<u32> {
+    let (h, m) = s.trim().split_once(':')?;
+    let h: u32 = h.trim().parse().ok()?;
+    let m: u32 = m.trim().parse().ok()?;
+    if h >= 24 || m >= 60 {
+        return None;
+    }
+    Some(h * 3600 + m * 60)
+}
+
+/// Parse a UTC offset ("+08:00", "+0800", "+8", "-0530", "Z"/"UTC") into seconds
+/// east of UTC. None if it is not a fixed offset (e.g. an IANA zone name).
+pub fn parse_utc_offset(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("z") || s.eq_ignore_ascii_case("utc") {
+        return Some(0);
+    }
+    let (sign, rest) = match s.strip_prefix('-') {
+        Some(r) => (-1, r),
+        None => (1, s.strip_prefix('+')?),
+    };
+    let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+    let (h, m): (u32, u32) = match (rest.split_once(':'), digits.len()) {
+        (Some((hh, mm)), _) => (hh.trim().parse().ok()?, mm.trim().parse().ok()?),
+        (None, 0) => return None,
+        (None, 1 | 2) => (digits.parse().ok()?, 0),
+        (None, _) => (
+            digits[..digits.len() - 2].parse().ok()?,
+            digits[digits.len() - 2..].parse().ok()?,
+        ),
+    };
+    if h >= 24 || m >= 60 {
+        return None;
+    }
+    Some(sign * (h as i64 * 3600 + m as i64 * 60))
 }
 
 /// How a cold-standby disk's mapping is torn down on spindown.
@@ -308,6 +407,67 @@ mountpoint = "/mnt/d"
         assert!(!d.is_cold_standby());
         assert_eq!(d.idle_timeout_secs(), 300);
         assert_eq!(d.power_off_method, PowerOffMethod::Auto);
+    }
+
+    #[test]
+    fn parse_hm_and_offset() {
+        assert_eq!(parse_hm("08:00"), Some(28_800));
+        assert_eq!(parse_hm("8:05"), Some(29_100));
+        assert_eq!(parse_hm("23:59"), Some(86_340));
+        assert_eq!(parse_hm("24:00"), None);
+        assert_eq!(parse_hm("8"), None);
+        assert_eq!(parse_utc_offset("+08:00"), Some(28_800));
+        assert_eq!(parse_utc_offset("+0800"), Some(28_800));
+        assert_eq!(parse_utc_offset("+8"), Some(28_800));
+        assert_eq!(parse_utc_offset("-0530"), Some(-19_800));
+        assert_eq!(parse_utc_offset("Z"), Some(0));
+        assert_eq!(parse_utc_offset("Asia/Shanghai"), None);
+    }
+
+    #[test]
+    fn schedule_window_and_grace() {
+        // Daytime window 08:00–23:00 (15h on).
+        let day = Schedule {
+            on: "08:00".into(),
+            off: "23:00".into(),
+            timezone: None,
+        };
+        assert!(day.contains(parse_hm("12:00").unwrap()));
+        assert!(!day.contains(parse_hm("02:00").unwrap()));
+        assert_eq!(day.on_window_secs(), 15 * 3600);
+        assert_eq!(day.grace_secs(), (15 * 3600) / 10);
+
+        // Overnight window 20:00–06:00 (10h on).
+        let night = Schedule {
+            on: "20:00".into(),
+            off: "06:00".into(),
+            timezone: None,
+        };
+        assert!(night.contains(parse_hm("23:00").unwrap()));
+        assert!(night.contains(parse_hm("05:00").unwrap()));
+        assert!(!night.contains(parse_hm("12:00").unwrap()));
+        assert_eq!(night.on_window_secs(), 10 * 3600);
+    }
+
+    #[test]
+    fn schedule_parses_from_toml() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[disk]]
+name = "arc"
+uuid = "u"
+mountpoint = "/mnt/arc"
+
+[disk.schedule]
+on = "08:00"
+off = "23:00"
+timezone = "Asia/Shanghai"
+"#,
+        )
+        .unwrap();
+        let s = cfg.disks[0].schedule.as_ref().unwrap();
+        assert_eq!(s.on, "08:00");
+        assert_eq!(s.timezone.as_deref(), Some("Asia/Shanghai"));
     }
 
     #[test]

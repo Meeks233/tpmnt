@@ -82,6 +82,8 @@ pub enum Command {
     UmountRemote(UmountRemoteArgs),
     /// Spin a disk down now: unmount + close mapping + power off the platters.
     Power(PowerArgs),
+    /// Apply disks' on/off schedule now: power up inside the window, down outside.
+    Schedule(ScheduleArgs),
     /// Idle watcher for a cold-standby disk (run by its systemd unit).
     #[command(hide = true)]
     Monitor(MonitorArgs),
@@ -237,6 +239,19 @@ pub struct MountRemoteArgs {
 pub struct PowerArgs {
     /// Name of the [[disk]] to spin down.
     pub name: String,
+}
+
+#[derive(Args, Debug)]
+pub struct ScheduleArgs {
+    /// Names of the [[disk]] entries to evaluate. Empty = all scheduled disks.
+    pub names: Vec<String>,
+    /// Run a single tick and exit (default: loop forever, like the systemd unit).
+    #[arg(long)]
+    pub once: bool,
+    /// Override the timezone for this run: a fixed offset ("+08:00") or an IANA
+    /// zone name ("Asia/Shanghai"). Overrides each disk's configured timezone.
+    #[arg(long)]
+    pub timezone: Option<String>,
 }
 
 #[derive(Args, Debug)]

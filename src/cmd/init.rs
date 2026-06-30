@@ -317,6 +317,7 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
             idle_timeout: r.idle_timeout.clone(),
             power_off_method: r.power_off_method,
             teardown: crate::config::Teardown::Direct,
+            schedule: None,
         };
         if !dry {
             register_disk(ctx, &disk)?;

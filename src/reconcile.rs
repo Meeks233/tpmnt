@@ -241,6 +241,7 @@ mod tests {
             idle_timeout: "5min".into(),
             power_off_method: crate::config::PowerOffMethod::Auto,
             teardown: crate::config::Teardown::Direct,
+            schedule: None,
         }
     }
 

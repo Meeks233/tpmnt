@@ -71,6 +71,10 @@ pub fn run(ctx: &Context) -> Result<Value> {
         let monitor_change =
             power::reconcile_monitor_unit(ctx, &ctx.paths.systemd_unit_dir(), disk, dry)?;
 
+        // Reconcile the schedule unit (written when a [disk.schedule] is set).
+        let schedule_change =
+            power::reconcile_schedule_unit(ctx, &ctx.paths.systemd_unit_dir(), disk, dry)?;
+
         // Ensure the mountpoint directory exists (not a mount; just the dir).
         if !dry {
             let _ = std::fs::create_dir_all(&disk.mountpoint);
@@ -88,6 +92,7 @@ pub fn run(ctx: &Context) -> Result<Value> {
             "power_profile": disk.power_profile,
             "idle_timeout_secs": disk.idle_timeout_secs(),
             "monitor_unit": monitor_change,
+            "schedule_unit": schedule_change,
             "changes": changes,
             "warnings": disk_warnings,
         }));

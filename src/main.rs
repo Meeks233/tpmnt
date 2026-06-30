@@ -60,6 +60,7 @@ fn main() -> ExitCode {
         Command::MountRemote(a) => cmd::mount_remote::run(&ctx, a),
         Command::UmountRemote(a) => cmd::mount_remote::umount(&ctx, a),
         Command::Power(a) => cmd::power::run(&ctx, a),
+        Command::Schedule(a) => cmd::power::schedule(&ctx, a),
         Command::Monitor(a) => cmd::power::monitor(&ctx, a),
         Command::PrintConfig | Command::GenMan(_) => unreachable!("handled above"),
     };
