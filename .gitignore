@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Packaging output
+/debian/*.deb
+*.deb
+
+# Local planning / prompt notes (not for distribution)
+tpmnt-plan.md
+*.local.md
+/scratch/
+/.scratch/
+
+# Editor / OS cruft
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store

@@ -1,0 +1,76 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tpmnt 1  "tpmnt 0.1.0" 
+.SH NAME
+tpmnt \- Unified, declarative, AI\-native LUKS2 + TPM2 enroll/auto\-decrypt/auto\-mount manager
+.SH SYNOPSIS
+\fBtpmnt\fR [\fB\-\-config\fR] [\fB\-\-json\fR] [\fB\-\-plan\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-debug\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-non\-interactive\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Unified, declarative, AI\-native LUKS2 + TPM2 enroll/auto\-decrypt/auto\-mount manager
+.SH OPTIONS
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR [default: /etc/tpmnt/tpmnt.toml]
+Path to the declarative TOML config
+.RS
+May also be specified with the \fBTPMNT_CONFIG\fR environment variable. 
+.RE
+.TP
+\fB\-\-json\fR
+Emit a structured JSON result instead of human text
+.TP
+\fB\-\-plan\fR
+Print the ordered execution plan (as JSON) and exit without touching anything
+.TP
+\fB\-\-dry\-run\fR
+Compute and show what would change, applying nothing
+.TP
+\fB\-v\fR, \fB\-\-debug\fR
+Emit per\-command structured trace (argv, exit, stdout, stderr, duration) to stderr
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Assume "yes" to confirmation prompts (required for destructive ops in non\-interactive use)
+.TP
+\fB\-\-non\-interactive\fR
+Never prompt; fail instead of asking. Implies machine\-driven use
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+tpmnt\-init(1)
+Greenfield: fully\-managed initialization of a (possibly blank) disk
+.TP
+tpmnt\-enroll(1)
+Enroll TPM2 on an existing LUKS2 device (asks for the passphrase once)
+.TP
+tpmnt\-apply(1)
+Idempotently reconcile the system (crypttab/fstab/units) to the config
+.TP
+tpmnt\-status(1)
+Report per\-disk LUKS2/token/crypttab/mount state
+.TP
+tpmnt\-migrate(1)
+On a new machine: re\-enroll the local TPM for each configured disk
+.TP
+tpmnt\-rollback(1)
+Restore a backed\-up header and revert config edits for a device
+.TP
+tpmnt\-mount\-remote(1)
+Client\-side: mount a remote tpmnt\-managed dir over sshfs (+ ProxyJump)
+.TP
+tpmnt\-umount\-remote(1)
+Client\-side: stop+disable a remote mount unit and unmount it
+.TP
+tpmnt\-power(1)
+Spin a disk down now: unmount + close mapping + power off the platters
+.TP
+tpmnt\-print\-config(1)
+Print the equivalent TOML config (for reproducible re\-apply)
+.TP
+tpmnt\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH VERSION
+v0.1.0

@@ -1,0 +1,258 @@
+# tpmnt
+
+**Unified, declarative, AI-native CLI for LUKS2 + TPM2 "enroll once → auto-decrypt → auto-mount".**
+
+The Linux disk-encryption stack is split across `systemd-cryptenroll` (register a TPM),
+`crypttab` (decrypt), and `fstab` (mount) — with no single tool that does all three from one
+declarative, portable config. `tpmnt` fills that gap. It is an **orchestrator**: it shells out to
+the trusted system tools (`cryptsetup`, `systemd-cryptenroll`, `systemd-cryptsetup`) and owns the
+declarative config + idempotent reconciliation around them. It never reimplements cryptography.
+
+> Status: **Phases A–C complete** — `enroll`, `apply`, `status`, `migrate`, `rollback` (A);
+> whole-disk `init` with key escrow (B); client-side `mount-remote` over sshfs with SSH ProxyJump
+> (C). Verified by automated self-tests including a real cold TPM2 unlock with no passphrase, an
+> age-encrypted escrow round-trip, and a self-healing remote mount through a bastion.
+
+## Why
+
+| Tool | enroll | decrypt | mount | declarative | migrate |
+|---|:---:|:---:|:---:|:---:|:---:|
+| `systemd-cryptenroll` | ✅ | ❌ | ❌ | ❌ | ❌ |
+| `crypttab` / `fstab` | — | ✅ | ✅ | partial | ❌ |
+| **tpmnt** | ✅ | ✅ | ✅ | ✅ (one TOML) | ✅ |
+
+## Install
+
+```sh
+cargo install --path .          # from this repo
+# or build a static binary / .deb (see Packaging below)
+```
+
+Runtime dependencies: `cryptsetup`, `systemd` (provides `systemd-cryptenroll` and
+`systemd-cryptsetup`), and a TPM2 (`/dev/tpmrm0`). For `init`: `gdisk` (sgdisk) and a
+filesystem tool (`mkfs.xfs`/`mkfs.ext4`/…); optionally `age` or `gpg` for encrypted key escrow.
+For `mount-remote`: `sshfs` + `fusermount3`.
+
+## Quickstart
+
+```sh
+# 1. Enroll TPM2 on an existing LUKS2 disk (asks for the passphrase once).
+sudo tpmnt enroll /dev/disk/by-uuid/<luks-uuid> --pcrs 7,14
+
+# 2. Describe the desired end state in /etc/tpmnt/tpmnt.toml:
+cat /etc/tpmnt/tpmnt.toml
+# [[disk]]
+# name       = "mycache"
+# uuid       = "e7e6fc65-..."
+# mountpoint = "/srv/mycache"
+# fstype     = "xfs"
+# pcrs       = [7, 14]
+
+# 3. Reconcile the system (writes crypttab + fstab, creates the mountpoint).
+sudo tpmnt apply
+
+# 4. Inspect reality.
+sudo tpmnt status            # human table
+sudo tpmnt status --json     # machine-readable
+```
+
+After a reboot the disk unlocks via the TPM (no passphrase) and mounts automatically. A
+passphrase/recovery keyslot is **always** kept as the portable trust root.
+
+## Whole-disk init (Phase B)
+
+`tpmnt init <device>` takes a (possibly blank) disk and does everything in one command:
+preflight guard → GPT partition → LUKS2 format → auto-generated passphrase **and** recovery key →
+**key escrow** → TPM2 enroll → filesystem → register + mount. Every step has a flag, a sane
+default, and a bypass. Run `tpmnt init --explain` to see them all.
+
+```sh
+# Fully-managed: blank disk -> encrypted, TPM-unlocking, mounted, key escrowed to age.
+sudo tpmnt init /dev/sdb \
+  --wipe --yes --non-interactive \
+  --name mycache --mountpoint /srv/mycache \
+  --escrow age:age1qz...your-pubkey... \
+  --pcrs 7,14 --with-pin
+# Writes the plaintext key bundle to key_backup AND an age-encrypted copy; refuses to finish
+# in auto mode unless at least one backup target was captured (E_BACKUP_REFUSED otherwise).
+```
+
+```sh
+# Bring-your-own passphrase, NO TPM, no recovery key, no filesystem (LUKS container only):
+sudo tpmnt init /dev/sdb \
+  --wipe --yes --non-interactive \
+  --passphrase-file ./secret.txt \
+  --no-tpm --no-recovery-key --i-understand-no-recovery \
+  --no-format --i-understand-no-backup
+```
+
+Safety gates: refuses any disk that already has data unless `--wipe --yes`
+(`E_DEVICE_HAS_DATA`); refuses to leave an unbacked-up volume after a failed escrow target
+(`E_ESCROW_FAILED`); `--plan` prints the full ordered JSON plan and touches nothing. Drive an
+entire init from a single TOML with `--from-config <file>`.
+
+## Remote mounts with jump hosts (Phase C)
+
+`tpmnt mount-remote` mounts a remote, already-decrypted tpmnt directory onto **this** machine over
+`sshfs`, managed by a self-healing systemd **--user** unit (no root, no fstab). Optional LAN jump
+hosts via SSH ProxyJump.
+
+```sh
+# Direct mount of a remote decrypted dir, kept alive by a user service:
+tpmnt mount-remote mycache \
+  --host alice@192.168.5.10 --remote-path /home/alice/hdd/mycache \
+  --mountpoint ~/hdd/mycache --identity ~/.ssh/id_ed25519
+```
+
+```sh
+# Through a LAN bastion (ProxyJump). Repeat / comma-separate --jump for multi-hop:
+tpmnt mount-remote mycache --jump me@192.168.5.2
+tpmnt mount-remote mycache --jump me@192.168.5.2,me@10.0.0.9   # multi-hop chain
+
+tpmnt mount-remote --list          # show configured remote mounts + live state
+tpmnt umount-remote mycache        # stop+disable the unit and unmount
+```
+
+`--plan` reports the exact `sshfs` argv, the effective ProxyJump chain, and per-hop reachability
+(with timeouts; it never hangs) without writing anything. The sftp path is auto-detected: tpmnt
+probes the remote sftp Subsystem and transparently falls back to exec'ing `sftp-server` directly
+when the remote sshd has no Subsystem (reported as `sftp_path_used`). When an explicit
+`--identity` is combined with `--jump`, tpmnt carries the key to every hop via a constructed
+ProxyCommand (plain `-J` does not propagate `-i`).
+
+## Power profiles: cold-standby auto power-off (Phase D)
+
+Each `[[disk]]` declares a **usage scenario**. A *cold-standby* (archival/backup) disk that has seen
+no **real access** for an idle window is automatically powered down — the whole disk, not just spun
+idle — to stop needless platter wear and save power. *always-on* disks (the default) are never
+touched.
+
+```toml
+[[disk]]
+name             = "archive"
+uuid             = "…"
+mountpoint       = "/srv/archive"
+power_profile    = "cold-standby"   # default: "always-on"
+idle_timeout     = "5min"           # also "30s", "10m", "1h", or bare seconds
+power_off_method = "auto"           # auto | standby (hdparm -y) | sleep (hdparm -Y) | power-off (udisksctl)
+```
+
+```sh
+sudo tpmnt apply              # installs tpmnt-monitor-archive.service + mounts the disk noatime
+sudo systemctl enable --now tpmnt-monitor-archive.service
+sudo tpmnt power archive      # manual one-shot: unmount → cryptsetup close → power down now
+```
+
+### Managing a distro-mounted disk (crypttab/automount)
+
+For a disk the OS already opens under its own `luks-<uuid>` mapping (via `crypttab`), set two extra
+keys so tpmnt drives the *existing* setup instead of its own:
+
+```toml
+[[disk]]
+name             = "mycache"
+uuid             = "e7e6fc65-…"
+device           = "/dev/sda"
+mapper           = "luks-e7e6fc65-…"   # manage the distro's existing mapping
+mountpoint       = "/home/alice/hdd/mycache"
+power_profile    = "cold-standby"
+idle_timeout     = "5min"
+power_off_method = "standby"
+teardown         = "systemd"           # stop the .mount + systemd-cryptsetup@ units (clean)
+```
+
+With `teardown = "systemd"`, spindown stops the `.mount` and `systemd-cryptsetup@<mapper>` units
+rather than running raw `umount`/`cryptsetup close`, so the disk re-opens **cleanly via TPM2** on
+the next access. Pair it with a systemd **automount** (`noauto,x-systemd.automount` in fstab) for a
+fully seamless cycle: idle → spindown (platters stop) → access → auto-unseal + remount in seconds.
+Here `apply` is *not* used (it would rewrite crypttab/fstab); only `monitor`/`power` act on the disk.
+
+`apply` writes a self-healing `tpmnt-monitor-<name>.service` per cold-standby disk and mounts it
+`noatime`. The monitor judges idleness from **real block I/O counters** (`/sys/block/<dm>/stat`),
+not atime — so background metadata never masks an idle disk, and an actual read/write resets the
+window. On expiry it runs the spindown sequence: **unmount → `cryptsetup close` → power off the
+backing disk** (`auto` picks `udisksctl power-off` for USB/removable, `hdparm -y` for rotational,
+and skips non-spinnable devices). `default` is `always-on`, so existing configs are unchanged.
+
+## AI-native interface
+
+Every command supports:
+
+- `--json` — structured result object (devices, uuids, token ids, mountpoints, fingerprints).
+- `--plan` — print the ordered JSON command plan and **exit without touching anything**.
+- `--dry-run` — compute changes, apply nothing.
+- `--debug` / `-v` — line-delimited JSON trace of every external command (argv, exit, stdout,
+  stderr, duration_ms).
+- `--non-interactive` / `--yes` — never prompt; pass the existing passphrase via `$PASSWORD` or
+  `--passphrase-file`.
+- Stable machine-readable error taxonomy (`E_NOT_LUKS2`, `E_NO_TPM`, `E_NO_FALLBACK_KEYSLOT`,
+  `E_NO_BACKUP`, …) with documented exit codes — never silent.
+
+```sh
+# Preview exactly what `apply` would do, as JSON, changing nothing:
+sudo tpmnt apply --plan
+```
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `tpmnt init <device>` | Greenfield whole-disk init: partition → LUKS2 → keys → escrow → TPM2 → fs → register + mount. Safe-by-default, every step bypassable. `--explain` lists all defaults. |
+| `tpmnt enroll <device>` | Back up the LUKS2 header, then enroll a TPM2 token via `systemd-cryptenroll`. Refuses TPM-only setups that have no passphrase fallback. |
+| `tpmnt apply` | Idempotently reconcile crypttab + the mount backend (fstab or systemd `.mount`) to the TOML. |
+| `tpmnt status` | Per disk: LUKS2? TPM2 token? crypttab entry? mounted? Plus environment detection. |
+| `tpmnt migrate` | On a new machine: re-enroll the **local** TPM for each disk (unlocked via its portable passphrase), then rebuild crypttab/fstab. |
+| `tpmnt rollback <device>` | Restore the backed-up header and revert tpmnt's config edits. |
+| `tpmnt mount-remote <name>` | Mount a remote decrypted dir over sshfs via a self-healing systemd --user unit, with optional ProxyJump bastions. |
+| `tpmnt umount-remote <name>` | Stop+disable the unit and unmount. |
+| `tpmnt power <name>` | Spin a disk down now: unmount → `cryptsetup close` → power off the backing disk. |
+| `tpmnt print-config` | Emit the equivalent TOML for reproducible re-apply. |
+
+### What "migrate" actually migrates
+
+TPM2-sealed secrets are **bound to the machine's TPM and cannot move**. What you carry between
+machines is the **declarative TOML**; on the new host `tpmnt migrate` re-enrolls the local TPM
+after unlocking each disk via its passphrase/recovery keyslot. That keyslot is the portable trust
+root and tpmnt refuses to remove it.
+
+## Safety model
+
+- **Header backup before every keyslot change** (`cryptsetup luksHeaderBackup`), restorable with
+  `tpmnt rollback`.
+- **Never TPM-only by force**: enrollment is refused unless a non-TPM fallback keyslot exists.
+- **Loud warnings** on weak policies (PCR-only with no PIN — see `SECURITY.md`).
+- **Idempotent + reversible**: re-running `apply` is a no-op; every edited file gets a `.bak`.
+- LUKS1, missing TPM, and unparseable configs fail with explicit error codes, never silently.
+
+## Self-test
+
+`scripts/selftest.sh` builds a throwaway loopback LUKS2 container, enrolls the **host TPM**, and
+proves an end-to-end **cold unlock with no passphrase** plus mount, idempotency, dry-run safety,
+rollback, status correctness, and the LUKS1 rejection path. Sealed blobs live in the loopback
+header, so the real TPM is never modified.
+
+```sh
+cargo build
+sudo -E env BIN="$PWD/target/debug/tpmnt" bash scripts/selftest.sh       # Phase A: 26 passed
+sudo -E env BIN="$PWD/target/debug/tpmnt" bash scripts/selftest-init.sh  # Phase B: 38 passed
+BIN="$PWD/target/debug/tpmnt" bash scripts/selftest-mount.sh             # Phase C: 29 passed
+```
+
+`selftest-init.sh` builds a blank loopback "disk", runs a full `init` (GPT + LUKS2 + auto
+passphrase + recovery key + TPM2 + xfs + age escrow + mount), proves cold unlock and an
+independent recovery-key open, and checks every guard + bypass. `selftest-mount.sh` stands up
+throwaway local sshd servers (with and without an sftp Subsystem, plus bastions) and validates
+direct/jump/multi-hop mounts, the sftp fallback, self-heal, and the error taxonomy — no root, no
+real LAN.
+
+## Packaging
+
+```sh
+cargo build --release
+./target/release/tpmnt gen-man man         # regenerate man/tpmnt.1
+cargo install cargo-deb && cargo deb       # build an installable .deb
+```
+
+## License
+
+Dual-licensed under MIT or Apache-2.0, at your option.

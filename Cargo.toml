@@ -1,0 +1,40 @@
+[package]
+name = "tpmnt"
+version = "0.1.0"
+edition = "2021"
+description = "Unified, declarative, AI-native CLI for LUKS2 + TPM2 enroll-once auto-decrypt and auto-mount"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Meeks233/tpmnt"
+readme = "README.md"
+keywords = ["luks2", "tpm2", "cryptsetup", "encryption", "systemd"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "tpmnt"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+clap_mangen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[profile.release]
+strip = true
+lto = true
+
+[package.metadata.deb]
+maintainer = "tpmnt maintainers"
+copyright = "2026, tpmnt maintainers"
+license-file = ["LICENSE-MIT", "0"]
+extended-description = "tpmnt unifies LUKS2 + TPM2 enrollment, declarative crypttab/fstab/systemd mount reconciliation, key escrow, and remote sshfs mounts into one AI-native CLI."
+depends = "$auto, cryptsetup, systemd, sshfs, gdisk"
+recommends = "age"
+section = "admin"
+priority = "optional"
+assets = [
+    ["target/release/tpmnt", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/tpmnt/README.md", "644"],
+    ["man/tpmnt.1", "usr/share/man/man1/tpmnt.1", "644"],
+]
