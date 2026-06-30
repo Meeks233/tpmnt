@@ -6,6 +6,11 @@
 # Packaging output
 /debian/*.deb
 *.deb
+*.rpm
+*.src.rpm
+/build/
+result
+result-*
 
 # Local planning / prompt notes (not for distribution)
 tpmnt-plan.md

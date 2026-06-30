@@ -1,0 +1,32 @@
+# Maintainer: Meeks <shadowblaze_kai@icloud.com>
+pkgname=tpmnt-bin
+_pkgname=tpmnt
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Unified, declarative CLI for LUKS2 + TPM2 enroll-once auto-decrypt and auto-mount (prebuilt static musl binary)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Meeks233/tpmnt"
+license=('MIT' 'Apache-2.0')
+provides=('tpmnt')
+conflicts=('tpmnt')
+depends=('cryptsetup' 'systemd' 'gptfdisk' 'sshfs')
+optdepends=('age: encrypted key escrow'
+            'hdparm: per-disk power profiles / spindown')
+_base="$url/releases/download/v$pkgver/$_pkgname-v$pkgver"
+source_x86_64=("$_base-x86_64-unknown-linux-musl.tar.gz")
+source_aarch64=("$_base-aarch64-unknown-linux-musl.tar.gz")
+sha256sums_x86_64=('SKIP')   # run `updpkgsums` to pin the release asset hash
+sha256sums_aarch64=('SKIP')
+
+package() {
+  case "$CARCH" in
+    x86_64)  _dir="$_pkgname-v$pkgver-x86_64-unknown-linux-musl" ;;
+    aarch64) _dir="$_pkgname-v$pkgver-aarch64-unknown-linux-musl" ;;
+  esac
+  cd "$_dir"
+  install -Dm0755 "$_pkgname" "$pkgdir/usr/bin/$_pkgname"
+  install -Dm0644 "$_pkgname.1" "$pkgdir/usr/share/man/man1/$_pkgname.1"
+  install -Dm0644 LICENSE-MIT "$pkgdir/usr/share/licenses/$_pkgname/LICENSE-MIT"
+  install -Dm0644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$_pkgname/LICENSE-APACHE"
+  install -Dm0644 README.md "$pkgdir/usr/share/doc/$_pkgname/README.md"
+}

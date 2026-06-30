@@ -57,6 +57,37 @@ curl -fsSLO https://github.com/Meeks233/tpmnt/releases/latest/download/tpmnt-x86
 sudo apt install ./tpmnt-x86_64-unknown-linux-gnu.deb
 ```
 
+### Fedora / RHEL / openSUSE (COPR)
+
+```sh
+sudo dnf copr enable meeks/tpmnt
+sudo dnf install tpmnt
+```
+
+### Ubuntu (PPA)
+
+```sh
+sudo add-apt-repository ppa:meeks/tpmnt
+sudo apt update
+sudo apt install tpmnt
+```
+
+### Arch Linux (AUR)
+
+```sh
+paru -S tpmnt        # build from source, or `tpmnt-bin` for the prebuilt binary
+```
+
+### Nix / NixOS
+
+```sh
+nix run github:Meeks233/tpmnt -- --help     # run without installing
+nix profile install github:Meeks233/tpmnt   # install into your profile
+```
+
+> Recipes for all of the above live in [`packaging/`](packaging/) — one
+> subdirectory per distro, each with build + publish instructions.
+
 ### From source
 
 ```sh
@@ -330,13 +361,17 @@ real LAN.
 
 Releases are produced by CI (`.github/workflows/release.yml`): every push builds the
 cross-platform binaries and publishes them to the rolling `edge` **pre-release**; pushing a
-`v*` tag publishes a stable **release** with `.deb` packages attached. To reproduce locally:
+`v*` tag publishes a stable **release** with `.deb` and `.rpm` packages attached. To reproduce
+locally:
 
 ```sh
 ./target/release/tpmnt gen-man man                      # regenerate man/tpmnt.1
 cargo build --release --target x86_64-unknown-linux-musl # fully static, dependency-free binary
 cargo install cargo-deb && cargo deb                     # build an installable .deb
 ```
+
+Distro-repository recipes (COPR, PPA, AUR, Nix) live under [`packaging/`](packaging/), one
+subdirectory per ecosystem with its own build + publish instructions.
 
 ## License
 

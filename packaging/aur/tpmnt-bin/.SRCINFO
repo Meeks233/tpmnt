@@ -1,0 +1,23 @@
+pkgbase = tpmnt-bin
+	pkgdesc = Unified, declarative CLI for LUKS2 + TPM2 enroll-once auto-decrypt and auto-mount (prebuilt static musl binary)
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/Meeks233/tpmnt
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	license = Apache-2.0
+	provides = tpmnt
+	conflicts = tpmnt
+	depends = cryptsetup
+	depends = systemd
+	depends = gptfdisk
+	depends = sshfs
+	optdepends = age: encrypted key escrow
+	optdepends = hdparm: per-disk power profiles / spindown
+	source_x86_64 = https://github.com/Meeks233/tpmnt/releases/download/v0.1.0/tpmnt-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+	sha256sums_x86_64 = SKIP
+	source_aarch64 = https://github.com/Meeks233/tpmnt/releases/download/v0.1.0/tpmnt-v0.1.0-aarch64-unknown-linux-musl.tar.gz
+	sha256sums_aarch64 = SKIP
+
+pkgname = tpmnt-bin

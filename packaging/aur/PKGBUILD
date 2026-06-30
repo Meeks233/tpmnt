@@ -1,0 +1,38 @@
+# Maintainer: Meeks <shadowblaze_kai@icloud.com>
+pkgname=tpmnt
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Unified, declarative CLI for LUKS2 + TPM2 enroll-once auto-decrypt and auto-mount"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Meeks233/tpmnt"
+license=('MIT' 'Apache-2.0')
+depends=('cryptsetup' 'systemd' 'gptfdisk' 'sshfs')
+optdepends=('age: encrypted key escrow'
+            'hdparm: per-disk power profiles / spindown')
+makedepends=('cargo')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')  # run `updpkgsums` to pin the release tarball hash
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_HOME="$srcdir/cargo-home"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_HOME="$srcdir/cargo-home"
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm0755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm0644 "man/$pkgname.1" "$pkgdir/usr/share/man/man1/$pkgname.1"
+  install -Dm0644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm0644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+  install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

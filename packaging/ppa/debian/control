@@ -1,0 +1,22 @@
+Source: tpmnt
+Section: admin
+Priority: optional
+Maintainer: Meeks <shadowblaze_kai@icloud.com>
+Build-Depends: debhelper-compat (= 13), cargo, rustc
+Standards-Version: 4.6.2
+Homepage: https://github.com/Meeks233/tpmnt
+Rules-Requires-Root: no
+
+Package: tpmnt
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}, cryptsetup, systemd, gdisk, sshfs
+Recommends: age, hdparm
+Description: declarative CLI for LUKS2 + TPM2 enroll-once auto-decrypt and auto-mount
+ tpmnt unifies LUKS2 + TPM2 "enroll once -> auto-decrypt -> auto-mount" behind one
+ declarative TOML config and an AI-native CLI (--json / --plan / --dry-run). It is
+ an orchestrator, not a crypto library: it drives cryptsetup, systemd-cryptenroll,
+ systemd-cryptsetup, sgdisk, mkfs and sshfs, owning the idempotent crypttab/fstab/
+ systemd-mount reconciliation around them.
+ .
+ Features whole-disk init with key escrow, remote sshfs mounts through SSH jump
+ hosts, and per-disk cold-standby power profiles.
