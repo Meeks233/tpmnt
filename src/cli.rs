@@ -68,6 +68,9 @@ pub enum Command {
     Apply,
     /// Report per-disk LUKS2/token/crypttab/mount state.
     Status,
+    /// Fancy, TUI-style dashboard of every disk's tpmnt-managed state.
+    #[command(alias = "dash")]
+    Dashboard,
     /// On a new machine: re-enroll the local TPM for each configured disk.
     Migrate,
     /// Restore a backed-up header and revert config edits for a device.

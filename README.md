@@ -95,6 +95,7 @@ sudo tpmnt apply
 # 4. Inspect reality.
 sudo tpmnt status            # human table
 sudo tpmnt status --json     # machine-readable
+sudo tpmnt dashboard         # fancy, TUI-style per-disk panels
 ```
 
 After a reboot the disk unlocks via the TPM (no passphrase) and mounts automatically. A
@@ -242,6 +243,7 @@ sudo tpmnt apply --plan
 | `tpmnt enroll <device>` | Back up the LUKS2 header, then enroll a TPM2 token via `systemd-cryptenroll`. Refuses TPM-only setups that have no passphrase fallback. |
 | `tpmnt apply` | Idempotently reconcile crypttab + the mount backend (fstab or systemd `.mount`) to the TOML. |
 | `tpmnt status` | Per disk: LUKS2? TPM2 token? crypttab entry? mounted? Plus environment detection. |
+| `tpmnt dashboard` | Fancy, TUI-style panels of every disk's tpmnt-managed state (encryption posture, fallback-key lockout risk, mount, cold-standby power). Same JSON as `status` under `--json`. |
 | `tpmnt migrate` | On a new machine: re-enroll the **local** TPM for each disk (unlocked via its portable passphrase), then rebuild crypttab/fstab. |
 | `tpmnt rollback <device>` | Restore the backed-up header and revert tpmnt's config edits. |
 | `tpmnt mount-remote <name>` | Mount a remote decrypted dir over sshfs via a self-healing systemd --user unit, with optional ProxyJump bastions. |
