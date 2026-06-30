@@ -43,7 +43,9 @@ jobs:
             } >> "$GITHUB_OUTPUT"
           fi
 
-  # Cross-compiled static binaries for the Linux ABIs/arches users deploy to.
+  # Cross-compiled binaries for the Linux arches users deploy to. The `-musl`
+  # targets are fully static (zero shared-library deps) — the primary artifact
+  # the README's install snippet pulls. Built on EVERY push (edge + releases).
   binaries:
     needs: channel
     runs-on: ubuntu-latest
@@ -51,10 +53,10 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - x86_64-unknown-linux-gnu
           - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-gnu
           - aarch64-unknown-linux-musl
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
@@ -85,9 +87,11 @@ jobs:
           path: tpmnt-*.tar.gz*
           if-no-files-found: error
 
-  # Debian packages for the path toward distro repos.
+  # Debian packages — the apt/distro path. Only built for stable RELEASES (tags),
+  # not on every commit; edge pre-releases stay lean (static binaries only).
   deb:
     needs: channel
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -125,8 +129,54 @@ jobs:
           path: tpmnt-*.deb
           if-no-files-found: error
 
+  # RPM packages — the dnf/zypper path. Stable RELEASES (tags) only, like .deb.
+  rpm:
+    needs: channel
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: rpm-${{ matrix.target }}
+      - name: Install aarch64 cross-linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          {
+            echo '[target.aarch64-unknown-linux-gnu]'
+            echo 'linker = "aarch64-linux-gnu-gcc"'
+          } >> .cargo/config.toml
+      - uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2
+        with:
+          tool: cargo-generate-rpm
+      - name: Build binary + .rpm
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --release --target "$TARGET"
+          # auto-req disabled: glibc is always present; we declare the tool deps ourselves.
+          cargo generate-rpm --target "$TARGET" --auto-req disabled --output "tpmnt-${TARGET}.rpm"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rpm-${{ matrix.target }}
+          path: tpmnt-*.rpm
+          if-no-files-found: error
+
   publish:
-    needs: [channel, binaries, deb]
+    needs: [channel, binaries, deb, rpm]
+    # `deb`/`rpm` are skipped on edge pushes; still publish if the binaries built.
+    if: ${{ always() && needs.binaries.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

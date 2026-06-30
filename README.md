@@ -23,15 +23,56 @@ declarative config + idempotent reconciliation around them. It never reimplement
 
 ## Install
 
+### Prebuilt static binary (recommended — zero library dependencies)
+
+`tpmnt` is a single **static musl binary**: no shared libraries, no glibc version to match,
+nothing to pull into your system. It runs as-is on any Linux distro (Debian, Ubuntu, Fedora,
+Arch, …). Copy-paste to fetch the latest **stable** release into `/usr/local/bin`:
+
 ```sh
-cargo install --path .          # from this repo
-# or build a static binary / .deb (see Packaging below)
+set -e
+arch=$(uname -m); case "$arch" in
+  x86_64)        target=x86_64-unknown-linux-musl ;;
+  aarch64|arm64) target=aarch64-unknown-linux-musl ;;
+  *) echo "unsupported arch: $arch" >&2; exit 1 ;;
+esac
+url=$(curl -fsSL https://api.github.com/repos/Meeks233/tpmnt/releases/latest \
+  | grep -o "https://[^\"]*-${target}\.tar\.gz" | head -n1)
+curl -fsSL "$url" | tar -xz -C /tmp
+sudo install -m 0755 /tmp/tpmnt-*-${target}/tpmnt /usr/local/bin/tpmnt
+tpmnt --version
 ```
 
-Runtime dependencies: `cryptsetup`, `systemd` (provides `systemd-cryptenroll` and
-`systemd-cryptsetup`), and a TPM2 (`/dev/tpmrm0`). For `init`: `gdisk` (sgdisk) and a
-filesystem tool (`mkfs.xfs`/`mkfs.ext4`/…); optionally `age` or `gpg` for encrypted key escrow.
-For `mount-remote`: `sshfs` + `fusermount3`.
+> Every commit also publishes a rolling `edge` build as a **pre-release**. The command above
+> uses GitHub's `releases/latest` endpoint, which excludes pre-releases, so it only ever fetches
+> a vetted, tagged stable release. To try the bleeding edge, grab a `tpmnt-edge-…` asset from the
+> [`edge` pre-release](https://github.com/Meeks233/tpmnt/releases/tag/edge).
+
+### Debian / Ubuntu (.deb)
+
+Each stable release also ships a `.deb` (declares its system-tool deps via apt):
+
+```sh
+curl -fsSLO https://github.com/Meeks233/tpmnt/releases/latest/download/tpmnt-x86_64-unknown-linux-gnu.deb
+sudo apt install ./tpmnt-x86_64-unknown-linux-gnu.deb
+```
+
+### From source
+
+```sh
+cargo install --path .
+```
+
+### Runtime dependencies (no dependency hell)
+
+tpmnt is an **orchestrator**: the binary itself links nothing but libc (and *nothing at all* in
+the static musl build). At runtime it shells out to standard system tools that ship with — or are
+one `apt`/`dnf install` from — every distro. None are obscure or version-fragile:
+
+- **always:** `cryptsetup`, `systemd` (provides `systemd-cryptenroll` / `systemd-cryptsetup`), a TPM2 at `/dev/tpmrm0`
+- **`init`:** `gdisk` (sgdisk) + a filesystem tool (`mkfs.xfs` / `mkfs.ext4` / …)
+- **`mount-remote`:** `sshfs` + `fusermount3`
+- **optional:** `age` or `gpg` (encrypted key escrow), `hdparm` (power profiles)
 
 ## Quickstart
 
@@ -247,10 +288,14 @@ real LAN.
 
 ## Packaging
 
+Releases are produced by CI (`.github/workflows/release.yml`): every push builds the
+cross-platform binaries and publishes them to the rolling `edge` **pre-release**; pushing a
+`v*` tag publishes a stable **release** with `.deb` packages attached. To reproduce locally:
+
 ```sh
-cargo build --release
-./target/release/tpmnt gen-man man         # regenerate man/tpmnt.1
-cargo install cargo-deb && cargo deb       # build an installable .deb
+./target/release/tpmnt gen-man man                      # regenerate man/tpmnt.1
+cargo build --release --target x86_64-unknown-linux-musl # fully static, dependency-free binary
+cargo install cargo-deb && cargo deb                     # build an installable .deb
 ```
 
 ## License

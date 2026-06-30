@@ -38,3 +38,23 @@ assets = [
     ["README.md", "usr/share/doc/tpmnt/README.md", "644"],
     ["man/tpmnt.1", "usr/share/man/man1/tpmnt.1", "644"],
 ]
+
+# RPM (Fedora/RHEL/openSUSE, dnf/zypper) — built by cargo-generate-rpm on tagged
+# releases. Shared-lib auto-requires are disabled (glibc is always present); the
+# `requires` below are the runtime *tools* tpmnt orchestrates, by Fedora package name.
+[package.metadata.generate-rpm]
+summary = "Unified, declarative CLI for LUKS2 + TPM2 enroll-once auto-decrypt and auto-mount"
+assets = [
+    { source = "target/release/tpmnt", dest = "/usr/bin/tpmnt", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/tpmnt/README.md", mode = "644", doc = true },
+    { source = "man/tpmnt.1", dest = "/usr/share/man/man1/tpmnt.1", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+cryptsetup = "*"
+systemd = "*"
+gdisk = "*"
+fuse-sshfs = "*"
+
+[package.metadata.generate-rpm.recommends]
+age = "*"
