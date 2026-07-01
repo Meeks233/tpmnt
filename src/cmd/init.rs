@@ -155,6 +155,21 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
     // the whole device.
     let target = resolve_target(ctx, &r, &op_device, dry)?;
 
+    // PIN (optional, or MANDATORY under [defaults].require_pin). The same PIN
+    // gates TPM2 unlock (NEWPIN below) and encrypts the unified recovery vault,
+    // so a single remembered value covers both. Resolved from $TPMNT_PIN or a
+    // prompt; when set from a prompt we export it so the shared enroll path
+    // (which reads $TPMNT_PIN as NEWPIN) picks up the very same value.
+    let want_pin = r.with_pin || ctx.config.defaults.require_pin;
+    let pin: Option<String> = if want_pin {
+        let p = crate::pin::resolve(None, ctx.global.non_interactive)?;
+        std::env::set_var("TPMNT_PIN", &p);
+        Some(p)
+    } else {
+        None
+    };
+    let effective_with_pin = want_pin;
+
     // 3. LUKS2 FORMAT + 4. KEY MATERIAL -------------------------------------
     let secure = if dry { None } else { Some(SecureDir::new()?) };
     let auto_mode = r.manual_passphrase.is_none();
@@ -234,7 +249,8 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
     let mut tpm_warnings: Vec<Value> = Vec::new();
     if !r.no_tpm && !dry {
         let pass = passphrase.clone();
-        let enroll = super::enroll::enroll_device(ctx, &target, &r.pcrs, r.with_pin, || Ok(pass))?;
+        let enroll =
+            super::enroll::enroll_device(ctx, &target, &r.pcrs, effective_with_pin, || Ok(pass))?;
         tpm_token = enroll
             .get("tpm2_token_present")
             .and_then(|v| v.as_bool())
@@ -259,7 +275,7 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
     });
     let bundle_json = serde_json::to_string_pretty(&bundle).unwrap();
 
-    let escrow_result = match run_escrow(ctx, &r, &bundle_json, dry) {
+    let mut escrow_result = match run_escrow(ctx, &r, &bundle_json, dry) {
         Ok(res) => res,
         Err(e) => {
             // Don't leave an unbacked-up volume open after an escrow failure.
@@ -268,6 +284,30 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
             return Err(e);
         }
     };
+
+    // PIN VAULT — the unified, TPM-independent recovery store. When a PIN is in
+    // play, drop this disk's bundle into the single vault too, so a broken TPM is
+    // always recoverable with just the PIN. Counts as a captured backup below.
+    if let Some(pin) = &pin {
+        match crate::vault::upsert(
+            &ctx.runner,
+            &ctx.config.defaults.key_backup,
+            pin,
+            &r.name,
+            &bundle,
+            dry,
+        ) {
+            Ok(path) => escrow_result
+                .written
+                .push(json!({ "type": "vault", "path": path })),
+            Err(e) => {
+                cleanup_mapper(ctx, &mapper);
+                detach_forward(ctx, &attachment);
+                return Err(e);
+            }
+        }
+    }
+
     // SAFETY GATE: in auto mode, refuse to finish with no captured backup.
     if auto_mode && !dry {
         let captured = !escrow_result.written.is_empty() || (r.emit_secrets && ctx.global.json);
@@ -326,7 +366,7 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
             mountpoint: r.mountpoint.clone(),
             fstype: r.fstype.clone(),
             pcrs: r.pcrs.clone(),
-            with_pin: r.with_pin,
+            with_pin: effective_with_pin,
             power_profile: r.power_profile,
             standby_timeout: r.standby_timeout.clone(),
             power_off_method: r.power_off_method,
@@ -972,6 +1012,14 @@ fn next_steps(r: &Resolved, escrow: &EscrowResult) -> Vec<String> {
                 .into(),
         );
     }
+    if has("vault") {
+        steps.push(
+            "Key also stored in the PIN vault: if the TPM ever can't unlock this disk, run \
+             `tpmnt recover <name> --from vault` (or just `tpmnt recover <name>`, which falls back \
+             to the vault) and enter your PIN to recover the raw LUKS key."
+                .into(),
+        );
+    }
     if r.no_tpm {
         steps.push("No TPM enrolled; the volume will prompt for a passphrase at boot.".into());
     } else {
@@ -993,6 +1041,7 @@ fn explain() -> Value {
             { "step": "key", "default": "auto diceware passphrase", "bypass": "--key-format base64 | --passphrase-file | --passphrase-stdin" },
             { "step": "recovery", "default": "add a recovery key", "bypass": "--no-recovery-key --i-understand-no-recovery" },
             { "step": "escrow", "default": "sealed (systemd-creds/TPM2) bundle to key_backup", "bypass": "--escrow age:|gpg:|pass: | --local-plaintext | --i-understand-no-backup | --emit-secrets" },
+            { "step": "pin_vault", "default": "with a PIN (--with-pin or [defaults].require_pin): also store the bundle in the unified PIN vault for TPM-independent recovery", "bypass": "omit --with-pin (and require_pin=false)" },
             { "step": "tpm", "default": "enroll TPM2 (warn on PCR-only)", "bypass": "--no-tpm | --pcrs | --with-pin" },
             { "step": "filesystem", "default": "mkfs.btrfs (data+metadata checksums for bit-rot detection; dup metadata; zstd compression)", "bypass": "--fstype xfs|ext4 | --no-format" },
             { "step": "register", "default": "add [[disk]] + apply + mount", "bypass": "--no-register | --mountpoint | --name" }

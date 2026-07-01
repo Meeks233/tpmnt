@@ -4,6 +4,7 @@ mod blockdev;
 mod cli;
 mod cmd;
 mod config;
+mod discover;
 mod env;
 mod error;
 mod exec;
@@ -11,9 +12,11 @@ mod keystore;
 mod luks;
 mod manage;
 mod paths;
+mod pin;
 mod power;
 mod reconcile;
 mod secret;
+mod vault;
 
 use std::process::ExitCode;
 
@@ -62,12 +65,14 @@ fn main() -> ExitCode {
         Command::Destroy(a) => cmd::destroy::run(&ctx, a),
         Command::Enroll(a) => cmd::enroll::run(&ctx, a),
         Command::Apply => cmd::apply::run(&ctx),
+        Command::Discover(a) => cmd::discover::run(&ctx, a),
         Command::Status | Command::Dashboard => cmd::status::run(&ctx),
-        Command::Migrate => cmd::migrate::run(&ctx),
+        Command::Migrate(a) => cmd::migrate::run(&ctx, a),
         Command::Rollback(a) => cmd::rollback::run(&ctx, a),
         Command::Remote(a) => cmd::remote::run(&ctx, a),
         Command::MountRemote(a) => cmd::mount_remote::run(&ctx, a),
         Command::UmountRemote(a) => cmd::mount_remote::umount(&ctx, a),
+        Command::Vault(a) => cmd::vault::run(&ctx, a),
         Command::Power(a) => cmd::power::run(&ctx, a),
         Command::Schedule(a) => cmd::power::schedule(&ctx, a),
         Command::Monitor(a) => cmd::power::monitor(&ctx, a),
@@ -105,6 +110,8 @@ fn render_human(command: &Command, value: &Value) {
         Command::Adopt(_) => print!("{}", cmd::adopt::render(value)),
         Command::Rename(_) => print!("{}", cmd::rename::render(value)),
         Command::Recover(_) => print!("{}", cmd::recover::render(value)),
+        Command::Discover(_) => print!("{}", cmd::discover::render(value)),
+        Command::Vault(_) => print!("{}", cmd::vault::render(value)),
         _ => {
             let action = value.get("action").and_then(|v| v.as_str());
             if let Some(a) = action {

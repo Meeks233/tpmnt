@@ -77,13 +77,18 @@ pub enum Command {
     Enroll(EnrollArgs),
     /// Idempotently reconcile the system (crypttab/fstab/units) to the config.
     Apply,
+    /// Re-locate each disk by its LUKS UUID and rebind the config if it moved
+    /// (local↔remote or between remotes). Runs automatically inside `apply`.
+    #[command(alias = "scan", alias = "locate")]
+    Discover(DiscoverArgs),
     /// Report per-disk LUKS2/token/crypttab/mount state.
     Status,
     /// Fancy, TUI-style dashboard of every disk's tpmnt-managed state.
     #[command(alias = "dash")]
     Dashboard,
-    /// On a new machine: re-enroll the local TPM for each configured disk.
-    Migrate,
+    /// On a new machine: re-enroll the local TPM for each configured disk. With a
+    /// PIN vault present, one PIN unlocks every disk (no per-disk $PASSWORD).
+    Migrate(MigrateArgs),
     /// Restore a backed-up header and revert config edits for a device.
     Rollback(RollbackArgs),
     /// List the SSH remotes this machine controls and the disks on each.
@@ -101,6 +106,9 @@ pub enum Command {
     /// Idle watcher for a cold-standby disk (run by its systemd unit).
     #[command(hide = true)]
     Monitor(MonitorArgs),
+    /// Manage the unified PIN vault (the TPM-independent recovery store):
+    /// `list` its disks, `rekey` its PIN, or `sync` it from sealed bundles.
+    Vault(VaultArgs),
     /// Print the equivalent TOML config (for reproducible re-apply).
     PrintConfig,
     /// Generate the man page to the given directory.
@@ -358,10 +366,23 @@ pub struct RecoverArgs {
     #[arg(long)]
     pub open: bool,
 
-    /// Alternate bundle source: creds:<file> (sealed) | plaintext:<file>.
-    /// Default: the sealed <name>.cred under key_backup.
+    /// Alternate bundle source: creds:<file> (sealed) | plaintext:<file> | vault
+    /// (the PIN-encrypted unified store). Default: the sealed <name>.cred under
+    /// key_backup, automatically falling back to the PIN vault if the TPM seal
+    /// can't be read (the "my TPM broke" recovery path).
     #[arg(long)]
     pub from: Option<String>,
+
+    /// Read the recovery PIN from this file (for the vault path). Otherwise
+    /// $TPMNT_PIN or an interactive prompt.
+    #[arg(long)]
+    pub pin_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct DiscoverArgs {
+    /// Disks to re-locate (default: all configured disks).
+    pub names: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -492,9 +513,42 @@ pub struct EnrollArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct MigrateArgs {
+    /// Read the PIN (to unlock the unified vault) from this file. Otherwise
+    /// $TPMNT_PIN or an interactive prompt. Ignored when no vault exists, in
+    /// which case each disk falls back to $PASSWORD.
+    #[arg(long)]
+    pub pin_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
 pub struct RollbackArgs {
     /// The device whose header backup should be restored.
     pub device: String,
+}
+
+#[derive(Args, Debug)]
+pub struct VaultArgs {
+    #[command(subcommand)]
+    pub action: VaultAction,
+
+    /// Read the current PIN from this file (else $TPMNT_PIN or a prompt).
+    #[arg(long, global = true)]
+    pub pin_file: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum VaultAction {
+    /// List the disks whose keys are stored in the vault (no secrets shown).
+    List,
+    /// Change the vault's PIN: decrypt with the current PIN, re-encrypt with a new one.
+    Rekey {
+        /// Read the NEW PIN from this file (else an interactive prompt).
+        #[arg(long)]
+        new_pin_file: Option<PathBuf>,
+    },
+    /// (Re)build the vault from the local sealed `.cred` bundles of managed disks.
+    Sync,
 }
 
 #[derive(Args, Debug)]

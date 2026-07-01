@@ -165,6 +165,18 @@ fn adopt_on_device(
     let dry = ctx.global.effective_dry_run();
     let device = &att.local_device;
 
+    // PIN (optional, or MANDATORY under [defaults].require_pin): gates TPM2 unlock
+    // and encrypts the unified recovery vault. Exported so the shared enroll path
+    // reads the same value as NEWPIN.
+    let want_pin = args.with_pin || ctx.config.defaults.require_pin;
+    let pin: Option<String> = if want_pin {
+        let p = crate::pin::resolve(None, ctx.global.non_interactive)?;
+        std::env::set_var("TPMNT_PIN", &p);
+        Some(p)
+    } else {
+        None
+    };
+
     // Verify it is LUKS2 (skip under dry-run — nothing was actually attached, so
     // the /dev/nbdN node, if the module is loaded, is empty and not inspectable).
     let inspectable = !dry && std::path::Path::new(device).exists();
@@ -242,7 +254,7 @@ fn adopt_on_device(
     if !args.no_tpm && inspectable {
         let pcrs = super::enroll::parse_pcrs(args.pcrs.as_deref())?;
         let pass = new_pass.clone();
-        let enroll = super::enroll::enroll_device(ctx, device, &pcrs, args.with_pin, || Ok(pass))?;
+        let enroll = super::enroll::enroll_device(ctx, device, &pcrs, want_pin, || Ok(pass))?;
         tpm_token = enroll
             .get("tpm2_token_present")
             .and_then(|v| v.as_bool())
@@ -291,6 +303,16 @@ fn adopt_on_device(
     } else {
         let path = keystore::seal(&ctx.runner, dir, &disk.name, bundle_json.as_bytes(), dry)?;
         json!({ "type": "sealed", "path": path })
+    };
+
+    // PIN vault — the TPM-independent recovery store. When a PIN is in play, put
+    // the freshly-generated managed bundle in the single vault too.
+    let vault_location = match &pin {
+        Some(pin) => {
+            let path = crate::vault::upsert(&ctx.runner, dir, pin, &disk.name, &bundle, dry)?;
+            Some(json!({ "type": "vault", "path": path }))
+        }
+        None => None,
     };
 
     // 5. Optionally rotate OUT the old key so only managed keys remain.
@@ -374,6 +396,7 @@ fn adopt_on_device(
         "recovery_key_added": recovery_key.is_some(),
         "old_key_removed": old_removed,
         "bundle": bundle_location,
+        "vault": vault_location,
         "mounted": mounted,
         "mountpoint": disk.mountpoint,
     });
@@ -466,7 +489,7 @@ fn register_new_disk(
         } else {
             cfg.defaults.pcrs.clone()
         },
-        with_pin: args.with_pin,
+        with_pin: args.with_pin || cfg.defaults.require_pin,
         power_profile: crate::config::PowerProfile::default(),
         standby_timeout: None,
         power_off_method: crate::config::PowerOffMethod::default(),

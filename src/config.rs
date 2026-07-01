@@ -39,6 +39,12 @@ pub struct Defaults {
     pub pcrs: Vec<u32>,
     #[serde(default)]
     pub with_pin: bool,
+    /// Force a PIN on every managed disk. When true, `init`/`adopt` require a PIN,
+    /// enroll the TPM2 with it, and always write the disk's bundle into the unified
+    /// PIN vault (the TPM-independent recovery store). This is the "强制PIN" switch:
+    /// no disk can be brought under management without a PIN-gated recovery path.
+    #[serde(default)]
+    pub require_pin: bool,
     #[serde(default = "default_key_backup")]
     pub key_backup: PathBuf,
     /// Global cold-standby idle window before the platters are spun down to
@@ -61,6 +67,7 @@ impl Default for Defaults {
             mount_backend: default_mount_backend(),
             pcrs: Vec::new(),
             with_pin: false,
+            require_pin: false,
             key_backup: default_key_backup(),
             standby_timeout: default_standby_timeout(),
         }

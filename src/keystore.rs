@@ -24,13 +24,21 @@ pub struct SecureDir {
 
 impl SecureDir {
     pub fn new() -> Result<SecureDir> {
+        Self::labeled("keys")
+    }
+
+    /// Like `new`, but with a caller-supplied label in the directory name. Two
+    /// SecureDirs alive at once in the same process (e.g. `init`'s key dir plus a
+    /// vault op) must not share a path, or one's `Drop` would delete the other's
+    /// keyfiles. Distinct labels keep them separate.
+    pub fn labeled(label: &str) -> Result<SecureDir> {
         // Prefer tmpfs (/dev/shm) so secrets never touch persistent storage.
         let base = if Path::new("/dev/shm").is_dir() {
             PathBuf::from("/dev/shm")
         } else {
             std::env::temp_dir()
         };
-        let path = base.join(format!("tpmnt-keys-{}", std::process::id()));
+        let path = base.join(format!("tpmnt-{label}-{}", std::process::id()));
         std::fs::create_dir_all(&path)
             .map_err(|e| Error::new(Code::EInternal, format!("mkdir securedir: {e}")))?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))

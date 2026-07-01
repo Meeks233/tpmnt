@@ -22,7 +22,17 @@ pub fn run(ctx: &Context) -> Result<Value> {
         );
     }
 
-    for disk in &ctx.config.disks {
+    // Auto-discovery: re-locate each disk by UUID and rebind the config before
+    // reconciling, so a disk that physically moved (local↔remote / remote↔remote)
+    // is transparently re-pointed. `relocate` persists the config when something
+    // moved; we reconcile against the returned (possibly rebound) config.
+    let (cfg, moved) = super::discover::relocate(ctx, None)?;
+    let moved_count = moved
+        .iter()
+        .filter(|r| r.get("moved").and_then(|v| v.as_bool()) == Some(true))
+        .count();
+
+    for disk in &cfg.disks {
         let device = disk.device_path();
         let mut disk_warnings: Vec<String> = Vec::new();
         let mut token_action = "unchanged";
@@ -109,6 +119,8 @@ pub fn run(ctx: &Context) -> Result<Value> {
         "ok": true,
         "dry_run": dry,
         "mount_backend": ctx.config.defaults.mount_backend,
+        "relocated": moved_count,
+        "discovery": moved,
         "disks": disks_out,
     }))
 }

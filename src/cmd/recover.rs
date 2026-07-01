@@ -16,8 +16,110 @@ use serde_json::{json, Value};
 use crate::cli::RecoverArgs;
 use crate::error::{Code, Error, Result};
 use crate::keystore::{self, SecureDir};
+use crate::{pin, vault};
 
 use super::Context;
+
+/// Resolve the key bundle for `name` from `--from` (creds:/plaintext:/vault) or,
+/// by default, the sealed local `.cred` — automatically falling back to the PIN
+/// vault when the TPM seal can't be read. Returns `(source, bundle)` where
+/// `source` is the JSON provenance shown to the caller.
+fn acquire_bundle(ctx: &Context, name: &str, args: &RecoverArgs) -> Result<(Value, Value)> {
+    let dir = &ctx.config.defaults.key_backup;
+
+    // Load + parse a sealed .cred bundle.
+    let from_creds = |path: &std::path::Path| -> Result<Value> {
+        let text = keystore::unseal(&ctx.runner, path, name)?;
+        parse_bundle(&text)
+    };
+    // Load one disk's bundle from the PIN vault (prompts for the PIN as needed).
+    let from_vault = || -> Result<Value> {
+        let pin = pin::resolve(args.pin_file.as_deref(), ctx.global.non_interactive)?;
+        let v = vault::load(&ctx.runner, dir, &pin)?;
+        vault::get(&v, name).cloned().ok_or_else(|| {
+            Error::new(
+                Code::EEscrowFailed,
+                format!("disk {name:?} is not in the PIN vault"),
+            )
+            .with_hint("was it enrolled with a PIN? check `tpmnt vault list`")
+        })
+    };
+
+    match args.from.as_deref() {
+        Some("vault") => Ok((
+            json!({ "kind": "vault", "path": vault::vault_path(dir) }),
+            from_vault()?,
+        )),
+        Some(spec) => {
+            let (kind, p) = spec.split_once(':').ok_or_else(|| {
+                Error::new(Code::EConfig, format!("bad --from spec: {spec:?}"))
+                    .with_hint("use creds:<file>, plaintext:<file>, or vault")
+            })?;
+            let path = PathBuf::from(p);
+            let bundle = match kind {
+                "creds" => {
+                    if !path.exists() {
+                        return Err(Error::new(
+                            Code::EEscrowFailed,
+                            format!("no sealed key bundle at {}", path.display()),
+                        ));
+                    }
+                    from_creds(&path)?
+                }
+                "plaintext" => {
+                    let text = std::fs::read_to_string(&path).map_err(|e| {
+                        Error::new(Code::EEscrowFailed, format!("read {}: {e}", path.display()))
+                    })?;
+                    parse_bundle(&text)?
+                }
+                other => {
+                    return Err(
+                        Error::new(Code::EConfig, format!("unknown --from kind: {other}"))
+                            .with_hint("use creds:<file>, plaintext:<file>, or vault"),
+                    )
+                }
+            };
+            Ok((json!({ "kind": kind, "path": path }), bundle))
+        }
+        // Default: the host-sealed .cred, with an automatic PIN-vault fallback so a
+        // broken/changed TPM still recovers as long as the vault + PIN exist.
+        None => {
+            let sealed = keystore::sealed_path(dir, name);
+            let cred_result = if sealed.exists() {
+                from_creds(&sealed)
+            } else {
+                Err(Error::new(
+                    Code::EEscrowFailed,
+                    format!("no sealed key bundle at {}", sealed.display()),
+                ))
+            };
+            match cred_result {
+                Ok(b) => Ok((json!({ "kind": "creds", "path": sealed }), b)),
+                Err(cred_err) => {
+                    if vault::vault_path(dir).exists() {
+                        eprintln!(
+                            "note: TPM-sealed bundle unavailable ({}); recovering from the PIN vault",
+                            cred_err.message
+                        );
+                        Ok((
+                            json!({ "kind": "vault", "path": vault::vault_path(dir), "fallback": true }),
+                            from_vault()?,
+                        ))
+                    } else {
+                        Err(cred_err.with_hint(
+                            "no PIN vault to fall back to; pass --from plaintext:<file>",
+                        ))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_bundle(text: &str) -> Result<Value> {
+    serde_json::from_str(text)
+        .map_err(|e| Error::new(Code::EInternal, format!("parse key bundle: {e}")))
+}
 
 pub fn run(ctx: &Context, args: &RecoverArgs) -> Result<Value> {
     let disk = ctx
@@ -33,43 +135,8 @@ pub fn run(ctx: &Context, args: &RecoverArgs) -> Result<Value> {
             .with_hint("run `tpmnt status` to list configured disks")
         })?;
 
-    // Resolve the bundle source: default is the sealed local .cred.
-    let dir = &ctx.config.defaults.key_backup;
-    let (kind, path) = match &args.from {
-        Some(spec) => {
-            let (k, p) = spec.split_once(':').ok_or_else(|| {
-                Error::new(Code::EConfig, format!("bad --from spec: {spec:?}"))
-                    .with_hint("use creds:<file> or plaintext:<file>")
-            })?;
-            (k.to_string(), PathBuf::from(p))
-        }
-        None => ("creds".to_string(), keystore::sealed_path(dir, &disk.name)),
-    };
-
-    let bundle_json = match kind.as_str() {
-        "creds" => {
-            if !path.exists() {
-                return Err(Error::new(
-                    Code::EEscrowFailed,
-                    format!("no sealed key bundle at {}", path.display()),
-                )
-                .with_hint("pass --from creds:<file> or plaintext:<file>"));
-            }
-            keystore::unseal(&ctx.runner, &path, &disk.name)?
-        }
-        "plaintext" => std::fs::read_to_string(&path).map_err(|e| {
-            Error::new(Code::EEscrowFailed, format!("read {}: {e}", path.display()))
-        })?,
-        other => {
-            return Err(
-                Error::new(Code::EConfig, format!("unknown --from kind: {other}"))
-                    .with_hint("use creds:<file> or plaintext:<file>"),
-            )
-        }
-    };
-
-    let bundle: Value = serde_json::from_str(&bundle_json)
-        .map_err(|e| Error::new(Code::EInternal, format!("parse key bundle: {e}")))?;
+    // Acquire the key bundle from the requested (or default) source.
+    let (source, bundle) = acquire_bundle(ctx, &disk.name, args)?;
     let passphrase = bundle.get("passphrase").and_then(|v| v.as_str());
     let recovery_key = bundle.get("recovery_key").and_then(|v| v.as_str());
 
@@ -121,7 +188,7 @@ pub fn run(ctx: &Context, args: &RecoverArgs) -> Result<Value> {
     let mut result = json!({
         "ok": true,
         "disk": disk.name,
-        "source": { "kind": kind, "path": path },
+        "source": source,
         "has_passphrase": passphrase.is_some(),
         "has_recovery_key": recovery_key.is_some(),
         "mapper_name": disk.mapper_name(),

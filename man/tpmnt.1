@@ -64,6 +64,9 @@ Enroll TPM2 on an existing LUKS2 device (asks for the passphrase once)
 tpmnt\-apply(1)
 Idempotently reconcile the system (crypttab/fstab/units) to the config
 .TP
+tpmnt\-discover(1)
+Re\-locate each disk by its LUKS UUID and rebind the config if it moved (local↔remote or between remotes). Runs automatically inside `apply`
+.TP
 tpmnt\-status(1)
 Report per\-disk LUKS2/token/crypttab/mount state
 .TP
@@ -71,7 +74,7 @@ tpmnt\-dashboard(1)
 Fancy, TUI\-style dashboard of every disk\*(Aqs tpmnt\-managed state
 .TP
 tpmnt\-migrate(1)
-On a new machine: re\-enroll the local TPM for each configured disk
+On a new machine: re\-enroll the local TPM for each configured disk. With a PIN vault present, one PIN unlocks every disk (no per\-disk $PASSWORD)
 .TP
 tpmnt\-rollback(1)
 Restore a backed\-up header and revert config edits for a device
@@ -90,6 +93,9 @@ Power a disk down (default), back up (\-\-on), or set its idle timeouts. Spin\-d
 .TP
 tpmnt\-schedule(1)
 Apply disks\*(Aq on/off schedule now: power up inside the window, down outside
+.TP
+tpmnt\-vault(1)
+Manage the unified PIN vault (the TPM\-independent recovery store): `list` its disks, `rekey` its PIN, or `sync` it from sealed bundles
 .TP
 tpmnt\-print\-config(1)
 Print the equivalent TOML config (for reproducible re\-apply)
