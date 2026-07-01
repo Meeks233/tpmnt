@@ -279,6 +279,77 @@ A `remote` name that matches no `[[remote]]` is treated as **local** (a typo can
 nowhere). Local-only concepts (crypttab, monitor units, `/sys` power state) report `null` for a
 remote disk rather than a misleading `false`; its mount and mapper state are read live over SSH.
 
+## Threat model: what "managed" means
+
+tpmnt only claims to **manage** a disk when it can keep its central promise:
+
+> the LUKS key was generated or imported **on this host**, and decryption happens **only on this
+> host** — never on a remote.
+
+Two independent facts decide it, and `status`/`dashboard` show the verdict per disk:
+
+1. **Provenance** — is there a tpmnt key bundle for this disk in the local key store? tpmnt writes
+   that bundle only when it generated the key (`init`) or rotated one in (`adopt`). Its presence is
+   the proof the key is *ours*, not a foreign key we merely forward.
+2. **Decrypt site** — does `cryptsetup open` run here? Always true for a local disk; for a remote
+   disk, true only when a ciphertext **transport** is configured (its raw LUKS blocks are forwarded
+   here and opened locally).
+
+A disk that fails either test is reported as **unmanaged**, with a machine-readable reason:
+
+| Verdict | Meaning |
+|---|---|
+| `managed` | key local, decryption local — tpmnt owns it end to end |
+| `foreign-key` | decrypts locally but no locally-generated key on record — tpmnt won't hold a foreign key |
+| `remote-decrypt` | a remote disk with no ciphertext transport — tpmnt **forwards blocks only** and never decrypts it |
+
+```sh
+tpmnt status            # MANAGED column: managed / foreign-key / remote-decrypt
+tpmnt dashboard         # a `manage` row per disk + a managed/unmanaged summary
+```
+
+### Taking ownership: `tpmnt adopt`
+
+Convert one or more existing disks (local **or** remote) to managed by rotating in a fresh,
+locally-generated key. You supply the disk's current key once; every crypto step runs on this host:
+
+```sh
+# Local disk: add a managed key + recovery, enroll this host's TPM2, seal the bundle.
+tpmnt adopt mydisk --old-key-file /path/to/oldkey
+
+# Several disks at once, and remove the old key so ONLY tpmnt-owned keys remain.
+echo -n "$OLDKEY" | tpmnt adopt arc backups --old-key-stdin --rotate-out-old
+
+# Preview the exact command sequence, touch nothing:
+tpmnt adopt arc --old-key-file oldkey --plan
+```
+
+For a **remote** disk, adopt forwards the disk's ciphertext to this host over **NBD-over-SSH**,
+opens it locally, adds the managed key, then detaches — so the key and every decryption stay local.
+It also records the disk's steady-state `transport` in the config.
+
+### Remote ciphertext transport (performance)
+
+A managed remote disk never decrypts on the remote. Instead its **raw LUKS ciphertext** is exported
+and decrypted here — the industry pattern for untrusted remote storage (cf. `ragnar`,
+"LUKS-over-NBD"). Because only ciphertext crosses the wire, confidentiality holds even over an
+untrusted link; block-level access also makes it **far faster than sshfs** (local page cache,
+readahead, filesystem run locally) and gains TRIM/discard, which SFTP cannot express.
+
+| `transport` | When | How |
+|---|---|---|
+| `nbd` (default) | WAN / untrusted path | `qemu-nbd` serves ciphertext on the remote loopback; an `ssh -L` tunnel carries it; `nbd-client` attaches `/dev/nbdN`. The tunnel adds integrity + hides access patterns. |
+| `nvme-tcp` | fast, trusted LAN | Lowest overhead / highest small-block IOPS (beats iSCSI); `nvme connect -t tcp` imports the remote `nvmet` export, then LUKS opens locally. |
+
+```toml
+[[disk]]
+name = "archive"
+uuid = "…"
+mountpoint = "/mnt/archive"
+remote = "nas"
+transport = "nbd"     # forward ciphertext here, decrypt locally → managed
+```
+
 ## Power profiles: cold-standby auto power-off (Phase D)
 
 Each `[[disk]]` declares a **usage scenario**. A *cold-standby* (archival/backup) disk that has seen
@@ -394,6 +465,7 @@ sudo tpmnt apply --plan
 | Command | Purpose |
 |---|---|
 | `tpmnt init <device>` | Greenfield whole-disk init: partition → LUKS2 → keys → escrow → TPM2 → fs → register + mount. Safe-by-default, every step bypassable. `--explain` lists all defaults. |
+| `tpmnt adopt <name…>` | Take ownership of existing disk(s): rotate in a fresh locally-generated managed key (auth'd by the old key), enroll this host's TPM2, seal the bundle, optionally `--rotate-out-old`. Remote disks are forwarded here via NBD-over-SSH so keys/decryption stay local. Flips the disk to **managed**. |
 | `tpmnt recover <name>` | Authenticate (root + this host's TPM) and retrieve a disk's generated key from the sealed store. `--show` reveals it; `--open` unlocks the LUKS mapping now for when TPM auto-unlock is broken. |
 | `tpmnt offline <name>` | Temporarily detach a disk: grace unmount → `cryptsetup close` (ciphertext at rest). Data **and** config are kept, so it can be brought back later. `--force` lazily detaches a busy mount. Remote disks are torn down over SSH. |
 | `tpmnt destroy <name>` | Permanently drop a disk's local management (config, crypttab/fstab, units, key bundles, header backup). Requires `--yes` (even for AI). **Does not format** — the LUKS ciphertext is left intact; reformat later if you need the space. |

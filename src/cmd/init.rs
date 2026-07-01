@@ -289,6 +289,7 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
             teardown: crate::config::Teardown::Direct,
             schedule: None,
             remote: None,
+            transport: None,
         };
         if !dry {
             register_disk(ctx, &disk)?;

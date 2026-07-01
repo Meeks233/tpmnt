@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use crate::error::Result;
 use crate::luks;
+use crate::manage;
 use crate::power;
 
 use super::Context;
@@ -62,9 +63,13 @@ pub fn run(ctx: &Context) -> Result<Value> {
             )
         };
 
+        let mgmt = manage::classify(&ctx.config, disk);
+
         rows.push(json!({
             "name": disk.name,
             "remote": disk.remote,
+            "transport": disk.transport.map(|t| t.as_str()),
+            "management": mgmt,
             "host": remote.map(|r| r.host.clone()),
             "device": device,
             "physical_device": physical_device,
@@ -135,8 +140,8 @@ pub fn render_table(value: &Value) -> String {
         ));
     }
     out.push_str(&format!(
-        "{:<12} {:<7} {:<6} {:<9} {:<8} {:<13} {}\n",
-        "NAME", "LUKS2", "TOKEN", "CRYPTTAB", "MOUNTED", "PROFILE", "MOUNTPOINT"
+        "{:<12} {:<11} {:<7} {:<6} {:<9} {:<8} {:<13} {}\n",
+        "NAME", "MANAGED", "LUKS2", "TOKEN", "CRYPTTAB", "MOUNTED", "PROFILE", "MOUNTPOINT"
     ));
     if let Some(disks) = value.get("disks").and_then(|v| v.as_array()) {
         if disks.is_empty() {
@@ -150,9 +155,23 @@ pub fn render_table(value: &Value) -> String {
                     "no"
                 }
             };
+            // Managed disks show "managed"; unmanaged show the reason.
+            let mgmt = d.get("management");
+            let managed = mgmt
+                .and_then(|m| m.get("managed"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mgmt_label = if managed {
+                "managed"
+            } else {
+                mgmt.and_then(|m| m.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unmanaged")
+            };
             out.push_str(&format!(
-                "{:<12} {:<7} {:<6} {:<9} {:<8} {:<13} {}\n",
+                "{:<12} {:<11} {:<7} {:<6} {:<9} {:<8} {:<13} {}\n",
                 d.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                mgmt_label,
                 yn("luks2"),
                 yn("tpm2_token"),
                 yn("crypttab"),
@@ -342,6 +361,8 @@ pub fn render_dashboard(value: &Value) -> String {
     let mut n_risk = 0;
     let mut n_mounted = 0;
     let mut n_remote = 0;
+    let mut n_managed = 0;
+    let mut n_unmanaged = 0;
 
     for d in disks {
         let name = s(d, "name");
@@ -381,6 +402,12 @@ pub fn render_dashboard(value: &Value) -> String {
             if let Some(rn) = d.get("remote").and_then(|v| v.as_str()) {
                 r.add(&format!("  [{rn}]"), DIM);
             }
+            // How its ciphertext reaches this host (managed remote) vs forward-only.
+            if let Some(t) = d.get("transport").and_then(|v| v.as_str()) {
+                r.add(&format!("  ciphertext via {t}"), GREEN);
+            } else {
+                r.add("  forward-only", YELLOW);
+            }
             out.push_str(&r.finish());
         }
 
@@ -416,6 +443,36 @@ pub fn render_dashboard(value: &Value) -> String {
         } else {
             n_risk += 1;
             r.add("▲ NO fallback key — lockout risk", YELLOW);
+        }
+        out.push_str(&r.finish());
+
+        // -- management verdict (the threat-model boundary) ----------------
+        let managed = d
+            .get("management")
+            .and_then(|m| m.get("managed"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let reason = d
+            .get("management")
+            .and_then(|m| m.get("reason"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        if managed {
+            n_managed += 1;
+        } else {
+            n_unmanaged += 1;
+        }
+        let mut r = Row::new(on);
+        r.add("manage   ", GREY);
+        if managed {
+            r.add("● managed", GREEN);
+            r.add("  key local · decrypt local", DIM);
+        } else if reason == "remote-decrypt" {
+            r.add("⇄ forward-only", YELLOW);
+            r.add("  no ciphertext transport — tpmnt doesn't decrypt it", DIM);
+        } else {
+            r.add("○ unmanaged", YELLOW);
+            r.add("  foreign key — run `tpmnt adopt`", DIM);
         }
         out.push_str(&r.finish());
 
@@ -484,13 +541,17 @@ pub fn render_dashboard(value: &Value) -> String {
     let total = disks.len();
     out.push('\n');
     out.push_str(&format!(
-        " {}  {} disk(s)  ·  {} encrypted  ·  {} auto-unlock  ·  {} mounted",
+        " {}  {} disk(s)  ·  {} managed  ·  {} encrypted  ·  {} auto-unlock  ·  {} mounted",
         paint("summary", GREY),
         total,
+        n_managed,
         n_enc,
         n_auto,
         n_mounted,
     ));
+    if n_unmanaged > 0 {
+        out.push_str(&paint(&format!("  ·  ○ {n_unmanaged} unmanaged"), YELLOW));
+    }
     if n_remote > 0 {
         out.push_str(&paint(&format!("  ·  ⇄ {n_remote} remote"), CYAN));
     }
@@ -523,7 +584,12 @@ mod tests {
                 "non_tpm_fallback": true, "crypttab": true,
                 "mountpoint": "/mnt/backup", "mounted": false,
                 "power_profile": "cold-standby", "idle_timeout_secs": 600,
-                "teardown": "direct", "monitored": true, "powered": false
+                "teardown": "direct", "monitored": true, "powered": false,
+                "management": {
+                    "managed": true, "reason": "managed",
+                    "detail": "key generated/imported locally and decryption stays on this host",
+                    "local_key": true, "local_decrypt": true
+                }
             }]
         })
     }
@@ -543,6 +609,27 @@ mod tests {
             !out.contains('\x1b'),
             "NO_COLOR output must carry no escapes"
         );
+    }
+
+    #[test]
+    fn dashboard_shows_management_verdict_and_footer() {
+        std::env::set_var("NO_COLOR", "1");
+        // Managed disk renders the managed row + footer count.
+        let out = render_dashboard(&sample());
+        assert!(out.contains("● managed"));
+        assert!(out.contains("key local · decrypt local"));
+        assert!(out.contains("1 managed"));
+
+        // A foreign-key (unmanaged) disk points the operator at `adopt`.
+        let mut v = sample();
+        v["disks"][0]["management"] = json!({
+            "managed": false, "reason": "foreign-key", "detail": "",
+            "local_key": false, "local_decrypt": true
+        });
+        let out = render_dashboard(&v);
+        assert!(out.contains("○ unmanaged"));
+        assert!(out.contains("tpmnt adopt"));
+        assert!(out.contains("1 unmanaged"));
     }
 
     #[test]

@@ -68,6 +68,8 @@ pub enum Command {
     Offline(OfflineArgs),
     /// Permanently remove a disk's local management (needs --yes); no format.
     Destroy(DestroyArgs),
+    /// Take ownership of existing disk(s): rotate in a locally-managed key.
+    Adopt(AdoptArgs),
     /// Enroll TPM2 on an existing LUKS2 device (asks for the passphrase once).
     Enroll(EnrollArgs),
     /// Idempotently reconcile the system (crypttab/fstab/units) to the config.
@@ -229,6 +231,64 @@ pub struct DestroyArgs {
     /// Lazily detach a busy mount (`umount -l`) during teardown.
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct AdoptArgs {
+    /// Name(s) of the [[disk]] entries to take ownership of.
+    pub names: Vec<String>,
+
+    /// Read the disk's current ("old") key from this file.
+    #[arg(long)]
+    pub old_key_file: Option<PathBuf>,
+    /// Read the disk's current ("old") key from stdin.
+    #[arg(long)]
+    pub old_key_stdin: bool,
+
+    /// For remote disks: steady-state ciphertext transport recorded in config
+    /// ("nbd" default, or "nvme-tcp"). Ciphertext forwarding during adopt always
+    /// uses NBD-over-SSH regardless.
+    #[arg(long)]
+    pub transport: Option<String>,
+    /// Local port for the NBD-over-SSH tunnel when forwarding a remote disk.
+    #[arg(long, default_value_t = 21809)]
+    pub local_port: u16,
+
+    /// Remove the old key after the managed key is added, so only tpmnt-owned
+    /// keys remain (default: keep the old key as an extra fallback).
+    #[arg(long)]
+    pub rotate_out_old: bool,
+
+    /// New managed key format: "diceware" (default) or "base64".
+    #[arg(long, default_value = "diceware")]
+    pub key_format: String,
+    /// Do not add a recovery key (needs --i-understand-no-recovery).
+    #[arg(long)]
+    pub no_recovery_key: bool,
+    /// Acknowledge skipping the recovery key.
+    #[arg(long)]
+    pub i_understand_no_recovery: bool,
+
+    /// Do not enroll TPM2 (managed key + recovery only).
+    #[arg(long)]
+    pub no_tpm: bool,
+    /// PCRs to bind, comma/plus separated. Empty = TPM-only (warns).
+    #[arg(long)]
+    pub pcrs: Option<String>,
+    /// Require a PIN in addition to the TPM.
+    #[arg(long)]
+    pub with_pin: bool,
+
+    /// Store the new key bundle in CLEARTEXT instead of sealing it to the TPM.
+    /// Requires --i-understand-plaintext-keys.
+    #[arg(long)]
+    pub local_plaintext: bool,
+    /// Acknowledge writing the local key bundle in cleartext.
+    #[arg(long)]
+    pub i_understand_plaintext_keys: bool,
+    /// Include the generated secrets in --json output (default: only locations).
+    #[arg(long)]
+    pub emit_secrets: bool,
 }
 
 #[derive(Args, Debug)]

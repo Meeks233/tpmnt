@@ -50,6 +50,9 @@ pub enum Code {
     /// A destructive lifecycle op (e.g. `destroy`) was invoked without the
     /// required explicit confirmation.
     EConfirmationRequired,
+    /// Forwarding a remote disk's ciphertext block device failed (NBD/NVMe-TCP
+    /// attach, tunnel, or missing remote).
+    ETransport,
 }
 
 impl Code {
@@ -75,6 +78,7 @@ impl Code {
             Code::EIdentityMissing => "E_IDENTITY_MISSING",
             Code::EPowerOff => "E_POWER_OFF",
             Code::EConfirmationRequired => "E_CONFIRMATION_REQUIRED",
+            Code::ETransport => "E_TRANSPORT",
         }
     }
 
@@ -101,6 +105,7 @@ impl Code {
             Code::EIdentityMissing => 19,
             Code::EPowerOff => 20,
             Code::EConfirmationRequired => 21,
+            Code::ETransport => 22,
         }
     }
 }

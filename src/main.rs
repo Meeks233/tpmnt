@@ -1,5 +1,6 @@
 //! tpmnt — unified, declarative, AI-native LUKS2 + TPM2 manager (MVP).
 
+mod blockdev;
 mod cli;
 mod cmd;
 mod config;
@@ -8,6 +9,7 @@ mod error;
 mod exec;
 mod keystore;
 mod luks;
+mod manage;
 mod paths;
 mod power;
 mod reconcile;
@@ -53,6 +55,7 @@ fn main() -> ExitCode {
 
     let result: Result<Value> = match &cli.command {
         Command::Init(a) => cmd::init::run(&ctx, a),
+        Command::Adopt(a) => cmd::adopt::run(&ctx, a),
         Command::Recover(a) => cmd::recover::run(&ctx, a),
         Command::Offline(a) => cmd::offline::run(&ctx, a),
         Command::Destroy(a) => cmd::destroy::run(&ctx, a),
@@ -98,6 +101,7 @@ fn render_human(command: &Command, value: &Value) {
         Command::Status => print!("{}", cmd::status::render_table(value)),
         Command::Dashboard => print!("{}", cmd::status::render_dashboard(value)),
         Command::Remote(_) => print!("{}", cmd::remote::render_table(value)),
+        Command::Adopt(_) => print!("{}", cmd::adopt::render(value)),
         Command::Recover(_) => print!("{}", cmd::recover::render(value)),
         _ => {
             let action = value.get("action").and_then(|v| v.as_str());

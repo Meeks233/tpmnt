@@ -111,6 +111,55 @@ pub struct Disk {
     /// that remote over SSH; the disk's `uuid`/`device` are interpreted there.
     #[serde(default)]
     pub remote: Option<String>,
+    /// For a REMOTE disk, how its *ciphertext* block device is forwarded to this
+    /// host so decryption happens locally (never on the remote). When set, tpmnt
+    /// attaches the remote's raw LUKS blocks here and runs `cryptsetup open`
+    /// locally — the key never leaves this machine. Unset on a remote disk means
+    /// tpmnt does NOT manage its decryption: it only forwards (see the threat
+    /// model in `manage.rs`). Ignored for local disks (they decrypt locally by
+    /// definition). `tpmnt adopt` sets this when taking ownership of a remote disk.
+    #[serde(default)]
+    pub transport: Option<Transport>,
+}
+
+/// How a remote disk's *ciphertext* block device is carried to this host so
+/// LUKS is unlocked locally (the key never leaves this machine). This is the
+/// industry pattern for untrusted remote storage: export the raw encrypted
+/// blocks, decrypt at the client. Confidentiality holds even over a plaintext
+/// link because only LUKS ciphertext crosses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Transport {
+    /// Network Block Device tunneled over SSH (default). `qemu-nbd` serves the
+    /// raw ciphertext on the remote; `nbd-client` attaches it here through an
+    /// `ssh -L` tunnel. Simple, widely packaged, supports TRIM/discard, and the
+    /// SSH tunnel adds integrity + hides access patterns on top of LUKS. Best
+    /// default for a WAN / untrusted path.
+    #[default]
+    Nbd,
+    /// NVMe-over-TCP: lowest protocol overhead and highest small-block IOPS on a
+    /// trusted LAN (outperforms iSCSI). `nvmet` exports the ciphertext on the
+    /// remote; `nvme connect` imports it here, then LUKS opens locally. Prefer on
+    /// a fast, trusted link where the SSH-tunnel CPU cost of NBD would cap speed.
+    NvmeTcp,
+}
+
+impl Transport {
+    /// Parse a CLI/config string ("nbd" / "nvme-tcp"); None if invalid.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "nbd" => Some(Self::Nbd),
+            "nvme-tcp" | "nvmetcp" | "nvme" | "tcp" => Some(Self::NvmeTcp),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Transport::Nbd => "nbd",
+            Transport::NvmeTcp => "nvme-tcp",
+        }
+    }
 }
 
 /// An SSH-reachable machine tpmnt controls. Purely a connection registry: the
@@ -359,6 +408,19 @@ impl Disk {
         self.power_profile == PowerProfile::ColdStandby
     }
 
+    /// Whether decryption of this disk happens on THIS host — the pivot of the
+    /// threat model. True for any local disk (`remote` unset); true for a remote
+    /// disk only when a ciphertext `transport` is configured (its raw blocks are
+    /// forwarded here and `cryptsetup open` runs locally). A remote disk with no
+    /// transport is forward-only: tpmnt never holds its key or decrypts it.
+    ///
+    /// NB: this reads the disk in isolation; a dangling `remote` name (no matching
+    /// `[[remote]]`) is treated as remote here, which is the safe side — such a
+    /// disk needs a transport to be considered locally-decrypting.
+    pub fn decrypts_locally(&self) -> bool {
+        self.remote.is_none() || self.transport.is_some()
+    }
+
     /// Parsed idle window in seconds (falls back to 300s on a malformed value).
     pub fn idle_timeout_secs(&self) -> u64 {
         parse_duration(&self.idle_timeout).unwrap_or(300)
@@ -444,6 +506,21 @@ impl Config {
 
     pub fn to_toml(&self) -> String {
         toml::to_string_pretty(self).unwrap_or_default()
+    }
+
+    /// Persist the config to `path`, creating the parent directory. Used by
+    /// commands that mutate the declarative source of truth (e.g. `adopt` setting
+    /// a disk's transport when taking ownership).
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(path, self.to_toml()).map_err(|e| {
+            Error::new(
+                Code::EConfig,
+                format!("write config {}: {e}", path.display()),
+            )
+        })
     }
 
     /// The [[remote]] a disk lives on, if any. None = a local disk (or a
@@ -662,6 +739,55 @@ remote = "does-not-exist"
         assert!(d.remote.is_some());
         assert!(cfg.remote_for(d).is_none());
         assert!(cfg.ssh_prefix_for(d).is_empty());
+    }
+
+    #[test]
+    fn transport_parse_and_decrypt_site() {
+        assert_eq!(Transport::parse("nbd"), Some(Transport::Nbd));
+        assert_eq!(Transport::parse("nvme-tcp"), Some(Transport::NvmeTcp));
+        assert_eq!(Transport::parse("NVMe_TCP"), Some(Transport::NvmeTcp));
+        assert_eq!(Transport::parse("iscsi"), None);
+
+        // A local disk always decrypts locally.
+        let cfg: Config = toml::from_str(
+            r#"
+[[disk]]
+name = "l"
+uuid = "u"
+mountpoint = "/mnt/l"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.disks[0].decrypts_locally());
+
+        // A remote disk WITHOUT a transport is forward-only (not local-decrypt).
+        let cfg: Config = toml::from_str(
+            r#"
+[[disk]]
+name = "r"
+uuid = "u"
+mountpoint = "/mnt/r"
+remote = "nas"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.disks[0].transport.is_none());
+        assert!(!cfg.disks[0].decrypts_locally());
+
+        // A remote disk WITH a transport forwards ciphertext + decrypts locally.
+        let cfg: Config = toml::from_str(
+            r#"
+[[disk]]
+name = "r"
+uuid = "u"
+mountpoint = "/mnt/r"
+remote = "nas"
+transport = "nvme-tcp"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.disks[0].transport, Some(Transport::NvmeTcp));
+        assert!(cfg.disks[0].decrypts_locally());
     }
 
     #[test]

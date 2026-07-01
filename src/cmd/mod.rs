@@ -2,6 +2,7 @@
 //! `main` renders it as text or JSON and, under `--plan`, emits the recorded
 //! command plan instead of applying.
 
+pub mod adopt;
 pub mod apply;
 pub mod destroy;
 pub mod enroll;

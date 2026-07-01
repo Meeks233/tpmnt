@@ -243,6 +243,7 @@ mod tests {
             teardown: crate::config::Teardown::Direct,
             schedule: None,
             remote: None,
+            transport: None,
         }
     }
 
