@@ -8,11 +8,13 @@
 //! mounted `noatime` (see `reconcile`) to keep the signal clean.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread::sleep;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::blockdev;
 use crate::config::{Disk, PowerOffMethod, Teardown};
 use crate::error::{Code, Error, Result};
 use crate::reconcile::{unit_name_for, FileChange};
@@ -264,6 +266,233 @@ enum SpinOutcome {
     Busy(Vec<Value>),
 }
 
+/// What `remove`-method power-off recorded so spin-up can bring the disk back:
+/// the SCSI host to rescan and (for a remote disk) how to rebuild the ciphertext
+/// forward. Persisted only while the disk is removed from its host OS.
+#[derive(Debug, Serialize, Deserialize)]
+struct ForwardState {
+    /// True when the disk lives on a remote host reached over SSH.
+    remote: bool,
+    /// The backing device on its host (e.g. `/dev/sda`).
+    remote_dev: String,
+    /// The SCSI host to rescan to re-probe the disk (e.g. `host6`).
+    scsi_host: String,
+    /// NBD port the remote `qemu-nbd` served on (remote disks only).
+    port: u16,
+}
+
+/// The `hostN` component of a device's sysfs path — the SCSI host to rescan to
+/// bring the device back after `.../device/delete`. Read on the disk's own host.
+fn scsi_host_of(ctx: &Context, prefix: &[String], base: &str) -> Option<String> {
+    let link = format!("/sys/block/{base}/device");
+    let target = if prefix.is_empty() {
+        std::fs::read_link(&link)
+            .ok()?
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        ctx.runner
+            .probe_on(
+                prefix,
+                &["readlink", "-f", &link],
+                "resolve device sysfs path",
+            )
+            .ok()
+            .map(|o| o.stdout.trim().to_string())?
+    };
+    target
+        .split('/')
+        .find(|c| c.starts_with("host") && c[4..].chars().all(|d| d.is_ascii_digit()))
+        .map(String::from)
+}
+
+/// Discover the NBD port a remote `qemu-nbd` currently serves `remote_dev` on, by
+/// parsing `pgrep -af qemu-nbd`. Needed to rebuild the exact same forward later.
+fn nbd_port_for(ctx: &Context, prefix: &[String], remote_dev: &str) -> Option<u16> {
+    let out = ctx
+        .runner
+        .probe_on(prefix, &["pgrep", "-af", "qemu-nbd"], "find qemu-nbd port")
+        .ok()?;
+    for line in out.stdout.lines() {
+        if line.split_whitespace().last() != Some(remote_dev) {
+            continue;
+        }
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if let Some(i) = toks.iter().position(|t| *t == "-p") {
+            if let Some(p) = toks.get(i + 1).and_then(|p| p.parse::<u16>().ok()) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Run `echo <val> > <path>` as root on the disk's host (local or remote). The
+/// `>` redirect needs a shell. Locally tpmnt is already root, so `sh -c` runs it
+/// directly. Remotely the command is flattened by ssh and re-parsed by the
+/// host's login shell, so the inner command is single-quoted to survive that
+/// pass — otherwise the login shell (not root's `sh`) would perform the redirect
+/// and be denied, and glob metacharacters would be expanded there.
+fn sysfs_write(ctx: &Context, prefix: &[String], path: &str, val: &str, why: &str) -> Result<()> {
+    let inner = format!("echo {val} > {path}");
+    if prefix.is_empty() {
+        ctx.runner
+            .run(&["sh", "-c", &inner], why)?
+            .require("sysfs write")?;
+    } else {
+        let quoted = format!("'{inner}'");
+        ctx.runner
+            .run_on(prefix, &["sudo", "-n", "sh", "-c", &quoted], why)?
+            .require("sysfs write")?;
+    }
+    Ok(())
+}
+
+/// The `remove` power-off tail: after the mapping is torn down, remove the
+/// backing block device from its host OS so the disk fully disappears (a disk
+/// manager's "Power Off Disk"), recording how to bring it back. For a remote
+/// disk the ciphertext forward is discovered and torn down first, since the
+/// device can't be deleted while `qemu-nbd` holds it open.
+fn remove_from_os(ctx: &Context, disk: &Disk) -> Result<Value> {
+    let (phys, prefix) = phys_and_prefix(ctx, disk);
+    let base = phys.rsplit('/').next().unwrap_or(&phys).to_string();
+    let remote = !prefix.is_empty();
+
+    let scsi_host = scsi_host_of(ctx, &prefix, &base).ok_or_else(|| {
+        Error::new(
+            Code::EPowerOff,
+            format!(
+                "cannot resolve SCSI host for {phys}; refusing to remove (would be unrecoverable)"
+            ),
+        )
+        .with_hint("the disk must sit on a rescannable SCSI/USB host for `remove` power-off")
+    })?;
+
+    // For a remote disk, discover + tear the forward down so the delete succeeds.
+    let mut port = 0u16;
+    if remote {
+        let local_dev = local_container(ctx, disk)?;
+        port = nbd_port_for(ctx, &prefix, &phys).ok_or_else(|| {
+            Error::new(
+                Code::ETransport,
+                format!("no qemu-nbd found serving {phys}; cannot record forward to rebuild"),
+            )
+        })?;
+        // Spin the platters down explicitly before the device leaves the OS.
+        let _ = ctx.runner.run_on(
+            &prefix,
+            &priv_argv(&prefix, &["hdparm", "-y", &phys]),
+            "spin down backing disk before removal",
+        );
+        blockdev::teardown_forward(
+            &ctx.runner,
+            &prefix,
+            &blockdev::control_path(port),
+            &local_dev,
+            &phys,
+        );
+    }
+
+    // Persist how to bring it back BEFORE the point of no return.
+    let state = ForwardState {
+        remote,
+        remote_dev: phys.clone(),
+        scsi_host: scsi_host.clone(),
+        port,
+    };
+    let sp = ctx.paths.forward_state(&disk.name);
+    if let Some(parent) = sp.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&sp, serde_json::to_string(&state).unwrap_or_default());
+
+    // Remove the block device from its host OS (spins it down via STOP UNIT too).
+    sysfs_write(
+        ctx,
+        &prefix,
+        &format!("/sys/block/{base}/device/delete"),
+        "1",
+        "remove backing disk from host OS (device/delete)",
+    )?;
+
+    Ok(json!({
+        "step": "power-down",
+        "device": phys,
+        "method_used": "remove",
+        "scsi_host": scsi_host,
+        "removed_from_os": true,
+    }))
+}
+
+/// Reverse `remove_from_os`: rescan the SCSI host to re-probe the disk, wait for
+/// it to reappear, and (for a remote disk) rebuild the ciphertext forward so the
+/// caller can `cryptsetup open` it again. No-op when no removal is recorded.
+fn restore_from_os(ctx: &Context, disk: &Disk) -> Result<Option<Value>> {
+    let sp = ctx.paths.forward_state(&disk.name);
+    let raw = match std::fs::read_to_string(&sp) {
+        Ok(s) => s,
+        Err(_) => return Ok(None), // nothing was removed; normal open path
+    };
+    let state: ForwardState = serde_json::from_str(&raw)
+        .map_err(|e| Error::new(Code::EInternal, format!("corrupt forward state: {e}")))?;
+    let prefix = ctx.config.ssh_prefix_for(disk);
+
+    // 1. Rescan the host so the kernel re-probes the (spun-down) disk.
+    sysfs_write(
+        ctx,
+        &prefix,
+        &format!("/sys/class/scsi_host/{}/scan", state.scsi_host),
+        "\"- - -\"",
+        "rescan SCSI host to bring the disk back",
+    )?;
+
+    // 2. Wait for the backing device to reappear (bounded).
+    let check = format!(
+        "/sys/block/{}",
+        state.remote_dev.rsplit('/').next().unwrap_or("")
+    );
+    let mut back = false;
+    for _ in 0..30 {
+        let present = if prefix.is_empty() {
+            Path::new(&check).exists()
+        } else {
+            ctx.runner
+                .probe_on(&prefix, &["test", "-e", &check], "await disk re-probe")
+                .map(|o| o.ok())
+                .unwrap_or(false)
+        };
+        if present {
+            back = true;
+            break;
+        }
+        sleep(Duration::from_millis(500));
+    }
+    if !back {
+        return Err(Error::new(
+            Code::EPowerOff,
+            format!(
+                "disk {} did not reappear after rescanning {}",
+                state.remote_dev, state.scsi_host
+            ),
+        )
+        .with_hint(
+            "the host may not support software rescan; a physical reconnect may be required",
+        ));
+    }
+
+    // 3. Rebuild the ciphertext forward for a remote disk.
+    if state.remote {
+        let remote = blockdev::require_remote(ctx.config.remote_for(disk), &disk.name)?;
+        blockdev::attach_nbd_over_ssh(&ctx.runner, remote, &state.remote_dev, state.port)?;
+    }
+
+    let _ = std::fs::remove_file(&sp);
+    Ok(Some(json!({
+        "step": "rescan", "scsi_host": state.scsi_host, "device": state.remote_dev,
+        "forward_rebuilt": state.remote,
+    })))
+}
+
 /// Spin the whole disk down: unmount -> close mapping -> power off the platters.
 /// Errors if the disk is busy (a clean unmount is impossible) rather than
 /// forcing it — `tpmnt schedule` uses the soft path that defers instead.
@@ -353,6 +582,25 @@ fn spindown_impl(ctx: &Context, disk: &Disk, soft: bool) -> Result<SpinOutcome> 
     // 3. power down the backing physical disk (on its host — local or remote).
     let (phys, prefix) = phys_and_prefix(ctx, disk);
     let resolved = resolve_method(ctx, &prefix, disk.power_off_method, &phys);
+
+    // `remove` fully removes the device from its host OS (reversible on spin-up).
+    // It owns its own spin-down + forward teardown, so it replaces the methods
+    // below rather than composing with them.
+    if resolved == PowerOffMethod::Remove {
+        let (method_used, skip_reason) = ("remove", None::<String>);
+        if dry {
+            steps.push(json!({"step": "power-down", "device": phys, "method_used": method_used, "planned": "remove device from host OS + record rescan"}));
+        } else {
+            steps.push(remove_from_os(ctx, disk)?);
+            let _ = std::fs::remove_file(ctx.paths.monitor_state(&disk.name));
+        }
+        return Ok(SpinOutcome::Down(json!({
+            "ok": true, "action": "power-off", "name": disk.name,
+            "method_used": method_used, "skip_reason": skip_reason,
+            "dry_run": dry, "steps": steps,
+        })));
+    }
+
     let (method_used, skip_reason) = match resolved {
         PowerOffMethod::PowerOff => {
             ctx.runner
@@ -393,6 +641,8 @@ fn spindown_impl(ctx: &Context, disk: &Disk, soft: bool) -> Result<SpinOutcome> 
                 "{phys} is neither removable nor rotational (e.g. loop/SSD); unmount+close done, no spindown"
             )),
         ),
+        // Handled above with an early return; kept for match exhaustiveness.
+        PowerOffMethod::Remove => unreachable!("remove is handled before this match"),
     };
     steps.push(json!({
         "step": "power-down",
@@ -417,9 +667,6 @@ fn spindown_impl(ctx: &Context, disk: &Disk, soft: bool) -> Result<SpinOutcome> 
     })))
 }
 
-/// Bring a scheduled disk up: open (TPM2 token) + mount, mirroring the disk's
-/// teardown mode so the pairing is symmetric. Idempotent — already-open /
-/// already-mounted steps are skipped.
 /// The LOCAL block device to `cryptsetup open` for this disk. A local disk uses
 /// its configured container path directly. A remote disk's ciphertext is
 /// forwarded here as a `/dev/nbdN`, so the config `device` (which names the disk
@@ -462,12 +709,24 @@ fn local_container(ctx: &Context, disk: &Disk) -> Result<String> {
     .with_hint("re-establish the ciphertext forward (`tpmnt apply`/`adopt`), then retry power-on"))
 }
 
+/// Bring a scheduled disk up: open (TPM2 token) + mount, mirroring the disk's
+/// teardown mode so the pairing is symmetric. Idempotent — already-open /
+/// already-mounted steps are skipped. If the disk was removed from its host OS
+/// (the `remove` power-off method), first rescan it back and rebuild its forward.
 pub fn spinup(ctx: &Context, disk: &Disk) -> Result<Value> {
     let dry = ctx.global.effective_dry_run();
     let mapper = disk.mapper_name();
     let mapper_dev = format!("/dev/mapper/{mapper}");
     let mp = disk.mountpoint.to_string_lossy().to_string();
     let mut steps: Vec<Value> = Vec::new();
+
+    // Reverse a `remove` power-off: rescan the disk back + rebuild the forward
+    // before anything tries to open it. No-op when nothing was removed.
+    if !dry {
+        if let Some(restore) = restore_from_os(ctx, disk)? {
+            steps.push(restore);
+        }
+    }
 
     match disk.teardown {
         Teardown::Direct => {
@@ -983,5 +1242,8 @@ mod tests {
         assert_eq!(resolve_method_traits(Auto, true, true), PowerOff);
         // An explicit method is always honored verbatim.
         assert_eq!(resolve_method_traits(Standby, false, false), Standby);
+        // `remove` is explicit and never trait-remapped, whatever the device is.
+        assert_eq!(resolve_method_traits(Remove, false, true), Remove);
+        assert_eq!(resolve_method_traits(Remove, true, true), Remove);
     }
 }

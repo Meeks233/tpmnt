@@ -58,4 +58,11 @@ impl Paths {
         self.at("var/lib/tpmnt/schedule")
             .join(format!("{name}.json"))
     }
+
+    /// Per-disk forward state for the `remove` power-off method: how to rebuild
+    /// the ciphertext forward and rescan the disk back after OS-level removal.
+    pub fn forward_state(&self, name: &str) -> PathBuf {
+        self.at("var/lib/tpmnt/forward")
+            .join(format!("{name}.json"))
+    }
 }

@@ -258,12 +258,15 @@ fn close_master(runner: &Runner, prefix: &[String], ctl: &str) {
 
 /// Kill the remote `qemu-nbd` serving `dev` (`sudo pkill -f`). Best-effort.
 fn kill_remote_server(runner: &Runner, prefix: &[String], ctl: &str, dev: &str) {
+    // Single-quote the pattern: ssh flattens argv and the remote login shell
+    // re-parses it, where `.*` would otherwise be glob-expanded (zsh even errors
+    // on a no-match, leaving qemu-nbd alive). Quotes make it a literal to pkill.
     let cmd = vec![
         "sudo".into(),
         "-n".into(),
         "pkill".into(),
         "-f".into(),
-        format!("qemu-nbd.*{dev}"),
+        format!("'qemu-nbd.*{dev}'"),
     ];
     let argv = serve_over_master_argv(prefix, ctl, &cmd);
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -286,6 +289,25 @@ pub fn detach(runner: &Runner, att: &Attachment) -> Result<()> {
         close_master(runner, &f.ssh_prefix, &f.control_path);
     }
     Ok(())
+}
+
+/// Tear down a forward addressed by its raw handles rather than an `Attachment`
+/// — used by the power module to reverse a forward it discovered (not created)
+/// so it can remove the backing disk from the remote OS. Best-effort, mirroring
+/// `detach`: disconnect the local nbd client, kill the remote qemu-nbd, close
+/// the ControlMaster tunnel.
+pub fn teardown_forward(
+    runner: &Runner,
+    ssh_prefix: &[String],
+    control_path: &str,
+    local_dev: &str,
+    remote_dev: &str,
+) {
+    let dis = nbd_client_disconnect_argv(local_dev);
+    let dis_ref: Vec<&str> = dis.iter().map(String::as_str).collect();
+    let _ = runner.run(&dis_ref, "disconnect local NBD device");
+    kill_remote_server(runner, ssh_prefix, control_path, remote_dev);
+    close_master(runner, ssh_prefix, control_path);
 }
 
 /// Guard against forwarding a remote disk that has no reachable `[[remote]]`.

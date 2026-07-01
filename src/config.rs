@@ -374,6 +374,13 @@ pub enum PowerOffMethod {
     Sleep,
     /// `udisksctl power-off`: truly cut power (USB docks/enclosures).
     PowerOff,
+    /// Spin down, then **remove the backing block device from its host OS**
+    /// (`echo 1 > /sys/block/<dev>/device/delete`) — the disk disappears from
+    /// the OS entirely, exactly like a disk manager's "Power Off Disk". Fully
+    /// reversible: spin-up rescans the SCSI host (`.../scan`) to bring it back,
+    /// so unlike `sleep` no physical replug is needed. For a remote NBD disk the
+    /// ciphertext forward is torn down before removal and rebuilt on spin-up.
+    Remove,
 }
 
 impl PowerOffMethod {
@@ -384,6 +391,7 @@ impl PowerOffMethod {
             "standby" => Some(Self::Standby),
             "sleep" => Some(Self::Sleep),
             "power-off" | "poweroff" | "off" => Some(Self::PowerOff),
+            "remove" | "eject" | "detach" => Some(Self::Remove),
             _ => None,
         }
     }
@@ -664,6 +672,20 @@ power_off_method = "power-off"
         assert!(d.is_cold_standby());
         assert_eq!(d.idle_timeout_secs(), 600);
         assert_eq!(d.power_off_method, PowerOffMethod::PowerOff);
+    }
+
+    #[test]
+    fn power_off_method_parses_all_aliases() {
+        use PowerOffMethod::*;
+        assert_eq!(PowerOffMethod::parse("auto"), Some(Auto));
+        assert_eq!(PowerOffMethod::parse("standby"), Some(Standby));
+        assert_eq!(PowerOffMethod::parse("sleep"), Some(Sleep));
+        assert_eq!(PowerOffMethod::parse("power-off"), Some(PowerOff));
+        // The new OS-level removal method and its aliases.
+        assert_eq!(PowerOffMethod::parse("remove"), Some(Remove));
+        assert_eq!(PowerOffMethod::parse("eject"), Some(Remove));
+        assert_eq!(PowerOffMethod::parse("detach"), Some(Remove));
+        assert_eq!(PowerOffMethod::parse("nonsense"), None);
     }
 
     #[test]

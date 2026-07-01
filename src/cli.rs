@@ -203,7 +203,8 @@ pub struct InitArgs {
     /// Idle window before a cold-standby disk powers off (e.g. "5min", "30s").
     #[arg(long)]
     pub idle_timeout: Option<String>,
-    /// Power-down method: "auto" (default), "standby", "sleep", or "power-off".
+    /// Power-down method: "auto" (default), "standby", "sleep", "power-off", or
+    /// "remove" (remove the disk from its host OS; reversible on next spin-up).
     #[arg(long)]
     pub power_off_method: Option<String>,
 
