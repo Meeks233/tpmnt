@@ -197,16 +197,21 @@ pub fn attach_nbd_over_ssh(
     let local_dev = free_nbd_device();
     let prefix = remote.ssh_prefix();
     let ctl = control_path(local_port);
+    // The remote qemu-nbd binds this port on the remote loopback. It must be
+    // unique per concurrent attach, or a second forward collides with the first
+    // ("Address already in use"). The local port is already unique per attach, so
+    // mirror it for the remote bind.
+    let remote_port = local_port;
 
     // 1. Open the persistent background tunnel (ControlMaster).
-    let tunnel = master_tunnel_argv(&prefix, &ctl, local_port, REMOTE_NBD_PORT);
+    let tunnel = master_tunnel_argv(&prefix, &ctl, local_port, remote_port);
     let tunnel_ref: Vec<&str> = tunnel.iter().map(String::as_str).collect();
     runner
         .run(&tunnel_ref, "open persistent SSH ControlMaster tunnel")?
         .require("ssh -M tunnel")?;
 
     // 2. Serve the remote ciphertext over that tunnel (qemu-nbd daemonizes).
-    let serve = qemu_nbd_serve_argv(ciphertext_dev, REMOTE_NBD_PORT);
+    let serve = qemu_nbd_serve_argv(ciphertext_dev, remote_port);
     let serve_cmd = serve_over_master_argv(&prefix, &ctl, &serve);
     let serve_ref: Vec<&str> = serve_cmd.iter().map(String::as_str).collect();
     if let Err(e) = runner

@@ -24,11 +24,12 @@ use serde_json::{json, Value};
 
 use crate::blockdev::{self, Attachment};
 use crate::cli::AdoptArgs;
-use crate::config::Transport;
+use crate::config::{Disk, Transport};
 use crate::error::{err, Code, Error, Result};
 use crate::keystore::{self, SecureDir};
 use crate::luks;
 use crate::manage;
+use crate::reconcile;
 use crate::secret;
 
 use super::Context;
@@ -44,19 +45,39 @@ pub fn run(ctx: &Context, args: &AdoptArgs) -> Result<Value> {
     };
     let old_key = read_old_key(ctx, args)?;
 
+    // Registering a brand-new (unconfigured) disk with --device is a single-disk
+    // operation: the one name is the logical name to record it under.
+    if args.device.is_some() && args.names.len() != 1 {
+        return err(
+            Code::EConfig,
+            "adopt --device takes exactly one disk name to register it under",
+        );
+    }
+
     let mut results = Vec::new();
     let mut config_dirty = false;
     let mut cfg = ctx.config.clone();
 
     for name in &args.names {
-        let idx = cfg
-            .disks
-            .iter()
-            .position(|d| &d.name == name)
-            .ok_or_else(|| {
-                Error::new(Code::EConfig, format!("no [[disk]] named {name:?}"))
-                    .with_hint("adopt operates on already-configured disks; run `tpmnt status`")
-            })?;
+        let idx = match cfg.disks.iter().position(|d| &d.name == name) {
+            Some(i) => i,
+            None if args.device.is_some() => {
+                // Take over an existing disk not yet in the config: build a
+                // [[disk]] entry from --device/--remote and persist it.
+                let disk = register_new_disk(ctx, &cfg, name, transport, args)?;
+                cfg.disks.push(disk);
+                config_dirty = true;
+                cfg.disks.len() - 1
+            }
+            None => {
+                return Err(
+                    Error::new(Code::EConfig, format!("no [[disk]] named {name:?}")).with_hint(
+                        "adopt operates on configured disks; pass --device to register a new one, \
+                         or run `tpmnt status`",
+                    ),
+                );
+            }
+        };
 
         // Snapshot the fields we need before borrowing cfg mutably later.
         let disk = cfg.disks[idx].clone();
@@ -110,10 +131,16 @@ fn adopt_one(
         Attachment::local(&disk.device_path())
     };
 
-    // Run the mutation, always detaching the forwarded ciphertext afterward.
+    // Run the mutation. With --mount we bring the disk online here (open + mount)
+    // using the still-attached ciphertext, so we must NOT detach on success — the
+    // forward stays live to back the mount (mirrors `init`). Otherwise, always
+    // detach the forwarded ciphertext when done.
     let outcome = adopt_on_device(ctx, disk, &att, old_key, args);
-    blockdev::detach(&ctx.runner, &att)?;
-    let out = outcome?;
+    let keep_attached = matches!(&outcome, Ok((_, true)));
+    if !keep_attached {
+        blockdev::detach(&ctx.runner, &att)?;
+    }
+    let (out, _mounted) = outcome?;
 
     let set_transport = if is_remote { Some(transport) } else { None };
     let mut result = out;
@@ -134,13 +161,13 @@ fn adopt_on_device(
     att: &Attachment,
     old_key: &str,
     args: &AdoptArgs,
-) -> Result<Value> {
+) -> Result<(Value, bool)> {
     let dry = ctx.global.effective_dry_run();
     let device = &att.local_device;
 
-    // Verify it is LUKS2 (skip when a forwarded device isn't materialized under
-    // dry-run — nothing was actually attached, so we only plan).
-    let inspectable = std::path::Path::new(device).exists();
+    // Verify it is LUKS2 (skip under dry-run — nothing was actually attached, so
+    // the /dev/nbdN node, if the module is loaded, is empty and not inspectable).
+    let inspectable = !dry && std::path::Path::new(device).exists();
     if inspectable {
         let info = luks::inspect(&ctx.runner, device)?;
         luks::require_luks2(&info, device)?;
@@ -284,6 +311,61 @@ fn adopt_on_device(
         old_removed = true;
     }
 
+    // 6. Bring the disk ONLINE now (--mount): open the mapping with the fresh
+    //    managed key on the still-attached ciphertext, reconcile the system files
+    //    to steady state, hide the raw transport device, and mount. The caller
+    //    keeps the ciphertext forward live so the mount persists.
+    let mut mounted = false;
+    if args.mount {
+        let mapper = disk.mapper_name();
+        let mapper_dev = format!("/dev/mapper/{mapper}");
+        if dry || !std::path::Path::new(&mapper_dev).exists() {
+            ctx.runner
+                .run(
+                    &[
+                        "cryptsetup",
+                        "open",
+                        device,
+                        &mapper,
+                        "--key-file",
+                        &new_kf.to_string_lossy(),
+                    ],
+                    "open the adopted LUKS mapping with the managed key",
+                )?
+                .require("cryptsetup open")?;
+        }
+        reconcile::reconcile_disk(
+            &ctx.paths.crypttab(),
+            &ctx.paths.fstab(),
+            &ctx.paths.systemd_unit_dir(),
+            disk,
+            ctx.config.defaults.mount_backend,
+            dry,
+        )?;
+        if disk.transport.is_some() {
+            super::ensure_nbd_hidden(ctx, dry)?;
+        }
+        if !dry {
+            std::fs::create_dir_all(&disk.mountpoint).ok();
+        }
+        // Mount with the SAME options reconcile wrote to fstab, so the live mount
+        // matches steady state (noatime for cold-standby, _netdev, compression).
+        let opts = reconcile::mount_options(disk);
+        ctx.runner
+            .run(
+                &[
+                    "mount",
+                    "-o",
+                    &opts,
+                    &mapper_dev,
+                    &disk.mountpoint.to_string_lossy(),
+                ],
+                "mount the adopted filesystem",
+            )?
+            .require("mount")?;
+        mounted = true;
+    }
+
     let mut result = json!({
         "action": "adopted",
         "device": device,
@@ -292,6 +374,8 @@ fn adopt_on_device(
         "recovery_key_added": recovery_key.is_some(),
         "old_key_removed": old_removed,
         "bundle": bundle_location,
+        "mounted": mounted,
+        "mountpoint": disk.mountpoint,
     });
     if args.emit_secrets && ctx.global.json {
         result["secrets"] = json!({
@@ -299,7 +383,98 @@ fn adopt_on_device(
             "recovery_key": recovery_key,
         });
     }
-    Ok(result)
+    Ok((result, mounted))
+}
+
+/// Build a [[disk]] entry for an existing, not-yet-configured disk from
+/// --device/--remote so `adopt` can take it over. The LUKS UUID is taken from
+/// --uuid or read from the header (over SSH for a remote disk). A remote disk is
+/// recorded with a ciphertext `transport` so it decrypts locally.
+fn register_new_disk(
+    ctx: &Context,
+    cfg: &crate::config::Config,
+    name: &str,
+    transport: Transport,
+    args: &AdoptArgs,
+) -> Result<Disk> {
+    let device = args.device.clone().expect("guarded by caller");
+    let is_remote = args.remote.is_some();
+
+    // Locate the remote (must exist) and its SSH prefix for header inspection.
+    let prefix = match &args.remote {
+        Some(rname) => {
+            let remote = cfg
+                .remotes
+                .iter()
+                .find(|r| &r.name == rname)
+                .ok_or_else(|| {
+                    Error::new(Code::EConfig, format!("unknown --remote {rname:?}"))
+                        .with_hint("add a matching [[remote]] entry to the config")
+                })?;
+            remote.ssh_prefix()
+        }
+        None => Vec::new(),
+    };
+
+    // Resolve the LUKS UUID: explicit override, else read the header. Reading a
+    // root-owned block device on the remote needs privilege, so a remote header
+    // dump runs under `sudo -n` (same as the qemu-nbd ciphertext export).
+    let uuid = match &args.uuid {
+        Some(u) => u.clone(),
+        None => {
+            let argv: Vec<&str> = if is_remote {
+                vec!["sudo", "-n", "cryptsetup", "luksDump", &device]
+            } else {
+                vec!["cryptsetup", "luksDump", &device]
+            };
+            let out = ctx
+                .runner
+                .probe_on(&prefix, &argv, "read LUKS header for registration")?;
+            if !out.ok() {
+                return Err(Error::new(
+                    Code::ENotLuks2,
+                    format!("cannot read LUKS header on {device}"),
+                )
+                .with_hint("pass --uuid, or check the device path / remote sudo access"));
+            }
+            let info = luks::parse_luks_dump(&out.stdout);
+            luks::require_luks2(&info, &device)?;
+            info.uuid.ok_or_else(|| {
+                Error::new(Code::ENotLuks2, format!("{device} has no LUKS UUID"))
+                    .with_hint("pass --uuid or check the device path")
+            })?
+        }
+    };
+
+    let mountpoint = args
+        .mountpoint
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("/mnt/{name}")));
+
+    Ok(Disk {
+        name: name.to_string(),
+        uuid,
+        device: Some(device),
+        mapper: None,
+        mountpoint,
+        fstype: args
+            .fstype
+            .clone()
+            .unwrap_or_else(|| cfg.defaults.fstype.clone()),
+        pcrs: if args.pcrs.is_some() {
+            super::enroll::parse_pcrs(args.pcrs.as_deref())?
+        } else {
+            cfg.defaults.pcrs.clone()
+        },
+        with_pin: args.with_pin,
+        power_profile: crate::config::PowerProfile::default(),
+        idle_timeout: "5min".to_string(),
+        power_off_method: crate::config::PowerOffMethod::default(),
+        teardown: crate::config::Teardown::Direct,
+        schedule: None,
+        remote: args.remote.clone(),
+        transport: if is_remote { Some(transport) } else { None },
+    })
 }
 
 /// Read the disk's current key from --old-key-file, --old-key-stdin, $OLD_PASSWORD,
@@ -384,6 +559,11 @@ pub fn render(value: &Value) -> String {
                     " · old key kept"
                 },
             ));
+            if d.get("mounted").and_then(|v| v.as_bool()) == Some(true) {
+                if let Some(mp) = d.get("mountpoint").and_then(|v| v.as_str()) {
+                    out.push_str(&format!("    mounted at {mp}\n"));
+                }
+            }
         }
     }
     out

@@ -13,6 +13,7 @@ pub mod offline;
 pub mod power;
 pub mod recover;
 pub mod remote;
+pub mod rename;
 pub mod rollback;
 pub mod status;
 

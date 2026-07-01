@@ -70,6 +70,9 @@ pub enum Command {
     Destroy(DestroyArgs),
     /// Take ownership of existing disk(s): rotate in a locally-managed key.
     Adopt(AdoptArgs),
+    /// Rename a disk's logical (mount) name; re-points crypttab/fstab and, if the
+    /// disk is currently mounted, remounts it live under the new name.
+    Rename(RenameArgs),
     /// Enroll TPM2 on an existing LUKS2 device (asks for the passphrase once).
     Enroll(EnrollArgs),
     /// Idempotently reconcile the system (crypttab/fstab/units) to the config.
@@ -243,8 +246,33 @@ pub struct DestroyArgs {
 
 #[derive(Args, Debug)]
 pub struct AdoptArgs {
-    /// Name(s) of the [[disk]] entries to take ownership of.
+    /// Name(s) of the [[disk]] entries to take ownership of. With --device this
+    /// is the single logical name to register the not-yet-configured disk under.
     pub names: Vec<String>,
+
+    /// Register and take over an EXISTING disk not yet in the config: give its
+    /// device path here (e.g. /dev/sda). Requires exactly one name. For a disk on
+    /// another machine, also pass --remote (its ciphertext is forwarded here).
+    #[arg(long)]
+    pub device: Option<String>,
+    /// The [[remote]] a newly-registered --device lives on (untrusted; only its
+    /// LUKS ciphertext is forwarded here, decryption stays local).
+    #[arg(long)]
+    pub remote: Option<String>,
+    /// Mountpoint for a newly-registered disk (default /mnt/<name>).
+    #[arg(long)]
+    pub mountpoint: Option<PathBuf>,
+    /// LUKS UUID for a newly-registered disk (default: read from its header).
+    #[arg(long)]
+    pub uuid: Option<String>,
+    /// Filesystem of a newly-registered disk, recorded for fstab (default: the
+    /// config's default fstype). The existing data is never reformatted.
+    #[arg(long)]
+    pub fstype: Option<String>,
+    /// After taking ownership, open + mount the disk locally now. For a remote
+    /// disk the ciphertext forward is left live so the mount persists.
+    #[arg(long)]
+    pub mount: bool,
 
     /// Read the disk's current ("old") key from this file.
     #[arg(long)]
@@ -297,6 +325,17 @@ pub struct AdoptArgs {
     /// Include the generated secrets in --json output (default: only locations).
     #[arg(long)]
     pub emit_secrets: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct RenameArgs {
+    /// Current logical name of the [[disk]] to rename.
+    pub old: String,
+    /// New logical name. Must not already be in use.
+    pub new: String,
+    /// Lazily detach a busy mount (`umount -l`) if the disk is mounted.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]
