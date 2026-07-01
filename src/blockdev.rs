@@ -14,10 +14,11 @@
 //! FUSE round-trip. It also gains TRIM/discard, which SFTP cannot express.
 //!
 //! Transports (see `config::Transport`):
-//!   * **NBD over SSH** (default) — `qemu-nbd` serves the ciphertext bound to the
-//!     remote's loopback; an `ssh -L` tunnel carries it here; `nbd-client`
-//!     attaches it as `/dev/nbdN`. Simple, universally packaged, and the tunnel
-//!     adds integrity + access-pattern hiding for a WAN.
+//!   * **NBD over SSH** (default) — a persistent background SSH ControlMaster
+//!     tunnel (`ssh -f -N -M -S … -L …`) carries the ciphertext; over that same
+//!     connection `sudo qemu-nbd --fork` serves the raw blocks bound to the
+//!     remote loopback; `nbd-client` attaches it here as `/dev/nbdN`. Teardown
+//!     disconnects the client, kills the remote server, and closes the master.
 //!   * **NVMe-TCP** — lowest overhead / highest small-block IOPS on a *trusted*
 //!     LAN (it beats iSCSI). Client attach is `nvme connect -t tcp`; the remote
 //!     `nvmet` subsystem is a persistent LAN export configured out of band.
@@ -37,6 +38,16 @@ use crate::exec::Runner;
 /// remote's 127.0.0.1 and using a distinct local port per attach.
 pub const REMOTE_NBD_PORT: u16 = 10809;
 
+/// Teardown handles for a forwarded attachment: the SSH prefix + ControlMaster
+/// socket used to reach the remote, and the remote device we served (for killing
+/// the server). Kept so `detach` can reverse exactly what `attach` set up.
+#[derive(Debug, Clone)]
+struct Forward {
+    ssh_prefix: Vec<String>,
+    control_path: String,
+    remote_dev: String,
+}
+
 /// A live ciphertext attachment: the local block device now backing the remote
 /// disk's raw LUKS blocks, plus the teardown handles. Hand the `local_device` to
 /// `cryptsetup open`; call `detach` when done.
@@ -47,6 +58,8 @@ pub struct Attachment {
     pub local_device: String,
     /// True when forwarding is active and `detach` must run.
     pub forwarded: bool,
+    /// Teardown handles; `None` for a local (non-forwarded) attachment.
+    forward: Option<Forward>,
 }
 
 impl Attachment {
@@ -55,18 +68,65 @@ impl Attachment {
         Attachment {
             local_device: device.to_string(),
             forwarded: false,
+            forward: None,
         }
     }
 }
 
-/// `qemu-nbd` argv to serve `ciphertext_dev` as raw NBD on the remote loopback.
-/// `--persistent`/`--shared` keep it up across reconnects; `--discard=unmap`
+/// The ControlMaster socket path for a forward on `local_port`. Unique per port
+/// so concurrent forwards don't collide.
+pub fn control_path(local_port: u16) -> String {
+    format!("/tmp/tpmnt-nbd-{local_port}.ctl")
+}
+
+/// Inject `flags` right after `ssh` in an SSH `prefix` (whose last element is the
+/// destination host), keeping the host last, then append an optional remote
+/// command. This is how every SSH invocation below is assembled from the disk's
+/// own prefix so `--plan` shows the real command.
+fn ssh_with(prefix: &[String], flags: &[String], remote_cmd: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::with_capacity(prefix.len() + flags.len() + remote_cmd.len());
+    let mut it = prefix.iter();
+    if let Some(first) = it.next() {
+        argv.push(first.clone()); // "ssh"
+    }
+    argv.extend(flags.iter().cloned());
+    argv.extend(it.cloned()); // remaining opts + host
+    argv.extend(remote_cmd.iter().cloned());
+    argv
+}
+
+/// `ssh -f -N -M -S <ctl> -L <lport>:127.0.0.1:<rport>` argv: open a persistent
+/// background ControlMaster tunnel and return immediately (`-f` backgrounds,
+/// `-N` runs no remote command). Later SSH calls reuse it via `-S <ctl>`.
+pub fn master_tunnel_argv(
+    prefix: &[String],
+    control_path: &str,
+    local_port: u16,
+    remote_port: u16,
+) -> Vec<String> {
+    let flags = vec![
+        "-f".into(),
+        "-N".into(),
+        "-M".into(),
+        "-S".into(),
+        control_path.to_string(),
+        "-L".into(),
+        format!("{local_port}:127.0.0.1:{remote_port}"),
+    ];
+    ssh_with(prefix, &flags, &[])
+}
+
+/// The remote command that serves `ciphertext_dev` as raw NBD on the loopback.
+/// `sudo -n` because serving a root-owned block device needs privilege; `--fork`
+/// daemonizes once the export is ready so the SSH call returns; `--discard=unmap`
 /// forwards TRIM; raw format means qemu never interprets the LUKS payload.
 pub fn qemu_nbd_serve_argv(ciphertext_dev: &str, port: u16) -> Vec<String> {
     vec![
+        "sudo".into(),
+        "-n".into(),
         "qemu-nbd".into(),
-        "--persistent".into(),
-        "--shared=8".into(),
+        "--fork".into(),
+        "--shared=1".into(),
         "--format=raw".into(),
         "--discard=unmap".into(),
         "--cache=none".into(),
@@ -78,23 +138,15 @@ pub fn qemu_nbd_serve_argv(ciphertext_dev: &str, port: u16) -> Vec<String> {
     ]
 }
 
-/// `ssh` argv that opens a background `-L local_port:127.0.0.1:remote_port`
-/// tunnel over the same connection `prefix` uses, then runs `serve` on the
-/// remote. Built by injecting the tunnel + no-shell flags into the SSH prefix
-/// (whose last element is the destination host).
-pub fn tunnel_and_serve_argv(prefix: &[String], local_port: u16, serve: &[String]) -> Vec<String> {
-    // prefix is `ssh <opts...> <host>`; keep host last, inject after "ssh".
-    let mut argv: Vec<String> = Vec::with_capacity(prefix.len() + serve.len() + 4);
-    let mut it = prefix.iter();
-    if let Some(first) = it.next() {
-        argv.push(first.clone()); // "ssh"
-    }
-    argv.push("-L".into());
-    argv.push(format!("{local_port}:127.0.0.1:{REMOTE_NBD_PORT}"));
-    argv.extend(it.cloned()); // remaining opts + host
-                              // Append the remote command (qemu-nbd …). ssh collapses trailing words.
-    argv.extend(serve.iter().cloned());
-    argv
+/// `ssh -S <ctl> … <host> <remote_cmd…>` argv: run `remote_cmd` over the existing
+/// ControlMaster connection (no re-auth, no new tunnel).
+pub fn serve_over_master_argv(
+    prefix: &[String],
+    control_path: &str,
+    remote_cmd: &[String],
+) -> Vec<String> {
+    let flags = vec!["-S".into(), control_path.to_string()];
+    ssh_with(prefix, &flags, remote_cmd)
 }
 
 /// `nbd-client` argv attaching the tunneled export to `local_dev`. `-persist`
@@ -132,7 +184,8 @@ pub fn free_nbd_device() -> String {
 }
 
 /// Forward a remote disk's ciphertext here over NBD-over-SSH and return the local
-/// block device. The remote serves via qemu-nbd through an SSH tunnel; we attach
+/// block device. A persistent background ControlMaster tunnel carries the link;
+/// `sudo qemu-nbd --fork` serves the raw blocks on the remote loopback; we attach
 /// with nbd-client. Under dry-run the steps are traced but skipped, and a
 /// deterministic device is returned so callers can preview the plan.
 pub fn attach_nbd_over_ssh(
@@ -143,49 +196,90 @@ pub fn attach_nbd_over_ssh(
 ) -> Result<Attachment> {
     let local_dev = free_nbd_device();
     let prefix = remote.ssh_prefix();
-    let serve = qemu_nbd_serve_argv(ciphertext_dev, REMOTE_NBD_PORT);
+    let ctl = control_path(local_port);
 
-    // 1. Open the tunnel + start the remote NBD server (backgrounded by ssh).
-    //    Run detached so it keeps serving; we don't wait on it.
-    let tunnel = tunnel_and_serve_argv(&prefix, local_port, &serve);
-    // Force ssh into the background-with-command form: -f -N would drop the
-    // command, so we keep the command and rely on qemu-nbd's own daemonization
-    // (it forks once the export is ready). Record it as a destructive step.
+    // 1. Open the persistent background tunnel (ControlMaster).
+    let tunnel = master_tunnel_argv(&prefix, &ctl, local_port, REMOTE_NBD_PORT);
     let tunnel_ref: Vec<&str> = tunnel.iter().map(String::as_str).collect();
     runner
-        .run(
-            &tunnel_ref,
-            "open SSH tunnel + serve remote ciphertext via qemu-nbd",
-        )?
-        .require("qemu-nbd over ssh")?;
+        .run(&tunnel_ref, "open persistent SSH ControlMaster tunnel")?
+        .require("ssh -M tunnel")?;
 
-    // 2. Attach the tunneled export locally.
+    // 2. Serve the remote ciphertext over that tunnel (qemu-nbd daemonizes).
+    let serve = qemu_nbd_serve_argv(ciphertext_dev, REMOTE_NBD_PORT);
+    let serve_cmd = serve_over_master_argv(&prefix, &ctl, &serve);
+    let serve_ref: Vec<&str> = serve_cmd.iter().map(String::as_str).collect();
+    if let Err(e) = runner
+        .run(&serve_ref, "serve remote ciphertext via qemu-nbd")
+        .and_then(|o| o.require("qemu-nbd --fork"))
+    {
+        close_master(runner, &prefix, &ctl);
+        return Err(e);
+    }
+
+    // 3. Attach the tunneled export locally.
     let client = nbd_client_argv(local_port, &local_dev);
     let client_ref: Vec<&str> = client.iter().map(String::as_str).collect();
-    runner
+    if let Err(e) = runner
         .run(
             &client_ref,
             "attach forwarded ciphertext as a local NBD device",
-        )?
-        .require("nbd-client")?;
+        )
+        .and_then(|o| o.require("nbd-client"))
+    {
+        kill_remote_server(runner, &prefix, &ctl, ciphertext_dev);
+        close_master(runner, &prefix, &ctl);
+        return Err(e);
+    }
 
     Ok(Attachment {
         local_device: local_dev,
         forwarded: true,
+        forward: Some(Forward {
+            ssh_prefix: prefix,
+            control_path: ctl,
+            remote_dev: ciphertext_dev.to_string(),
+        }),
     })
 }
 
-/// Tear down a ciphertext attachment: disconnect nbd-client locally. The remote
-/// qemu-nbd + tunnel exit on their own once the client disconnects and the SSH
-/// channel closes. No-op for a local (non-forwarded) attachment.
+/// Close the ControlMaster tunnel (`ssh -S <ctl> -O exit`). Best-effort.
+fn close_master(runner: &Runner, prefix: &[String], ctl: &str) {
+    let flags = vec!["-S".into(), ctl.to_string(), "-O".into(), "exit".into()];
+    let argv = ssh_with(prefix, &flags, &[]);
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let _ = runner.run(&refs, "close SSH ControlMaster tunnel");
+}
+
+/// Kill the remote `qemu-nbd` serving `dev` (`sudo pkill -f`). Best-effort.
+fn kill_remote_server(runner: &Runner, prefix: &[String], ctl: &str, dev: &str) {
+    let cmd = vec![
+        "sudo".into(),
+        "-n".into(),
+        "pkill".into(),
+        "-f".into(),
+        format!("qemu-nbd.*{dev}"),
+    ];
+    let argv = serve_over_master_argv(prefix, ctl, &cmd);
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let _ = runner.run(&refs, "stop remote qemu-nbd server");
+}
+
+/// Tear down a ciphertext attachment: disconnect nbd-client locally, kill the
+/// remote qemu-nbd, and close the ControlMaster tunnel. No-op for a local
+/// (non-forwarded) attachment. Best-effort so a failed step can't mask the
+/// primary result.
 pub fn detach(runner: &Runner, att: &Attachment) -> Result<()> {
     if !att.forwarded {
         return Ok(());
     }
     let dis = nbd_client_disconnect_argv(&att.local_device);
     let dis_ref: Vec<&str> = dis.iter().map(String::as_str).collect();
-    // Best-effort: a failed disconnect shouldn't mask the primary result.
     let _ = runner.run(&dis_ref, "disconnect local NBD device");
+    if let Some(f) = &att.forward {
+        kill_remote_server(runner, &f.ssh_prefix, &f.control_path, &f.remote_dev);
+        close_master(runner, &f.ssh_prefix, &f.control_path);
+    }
     Ok(())
 }
 
@@ -216,29 +310,43 @@ mod tests {
     #[test]
     fn qemu_nbd_serves_raw_ciphertext_on_loopback() {
         let a = qemu_nbd_serve_argv("/dev/sdb1", 10809);
-        assert_eq!(a[0], "qemu-nbd");
+        assert_eq!(a[0], "sudo"); // needs privilege to read the block device
+        assert!(a.contains(&"qemu-nbd".to_string()));
+        assert!(a.contains(&"--fork".to_string())); // daemonizes so ssh returns
         assert!(a.contains(&"--format=raw".to_string()));
         assert!(a.contains(&"127.0.0.1".to_string()));
         assert_eq!(a.last().unwrap(), "/dev/sdb1");
     }
 
     #[test]
-    fn tunnel_injects_dash_l_after_ssh_and_keeps_host_last_then_command() {
+    fn master_tunnel_injects_flags_after_ssh_and_keeps_host_last() {
         let prefix = nas().ssh_prefix();
-        let serve = qemu_nbd_serve_argv("/dev/sdb1", REMOTE_NBD_PORT);
-        let argv = tunnel_and_serve_argv(&prefix, 21809, &serve);
+        let ctl = control_path(21809);
+        let argv = master_tunnel_argv(&prefix, &ctl, 21809, REMOTE_NBD_PORT);
         assert_eq!(argv[0], "ssh");
-        assert_eq!(argv[1], "-L");
-        assert_eq!(argv[2], format!("21809:127.0.0.1:{REMOTE_NBD_PORT}"));
-        // Identity / jump / port options from the prefix survive.
+        assert!(argv.windows(2).any(|w| w == ["-M", "-S"]));
+        assert!(argv.contains(&format!("21809:127.0.0.1:{REMOTE_NBD_PORT}")));
+        assert!(argv.contains(&"-f".to_string()) && argv.contains(&"-N".to_string()));
+        // Identity / jump options from the prefix survive, host is present.
         assert!(argv.contains(&"-i".to_string()));
         assert!(argv.contains(&"-J".to_string()));
-        assert!(argv.contains(&"/k/id".to_string()));
+        assert!(argv.contains(&"alice@10.0.0.5".to_string()));
+        // No remote command on the master tunnel.
+        assert!(!argv.contains(&"qemu-nbd".to_string()));
+    }
+
+    #[test]
+    fn serve_over_master_reuses_control_socket_and_trails_command() {
+        let prefix = nas().ssh_prefix();
+        let ctl = control_path(21809);
+        let serve = qemu_nbd_serve_argv("/dev/sdb1", REMOTE_NBD_PORT);
+        let argv = serve_over_master_argv(&prefix, &ctl, &serve);
+        assert_eq!(argv[0], "ssh");
+        assert!(argv.windows(2).any(|w| w == ["-S", ctl.as_str()]));
         // The remote command trails after the host.
-        assert!(argv.contains(&"qemu-nbd".to_string()));
         let host_idx = argv.iter().position(|s| s == "alice@10.0.0.5").unwrap();
-        let qemu_idx = argv.iter().position(|s| s == "qemu-nbd").unwrap();
-        assert!(host_idx < qemu_idx, "host must precede the remote command");
+        let sudo_idx = argv.iter().position(|s| s == "sudo").unwrap();
+        assert!(host_idx < sudo_idx, "host must precede the remote command");
     }
 
     #[test]

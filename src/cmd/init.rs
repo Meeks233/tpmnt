@@ -45,11 +45,15 @@ struct InitSpec {
     power_profile: Option<String>,
     idle_timeout: Option<String>,
     power_off_method: Option<String>,
+    remote: Option<String>,
 }
 
 /// The fully-resolved init request (CLI flags merged over `--from-config`).
 struct Resolved {
     device: String,
+    /// When set, `device` names a block device on this [[remote]]. Its ciphertext
+    /// is forwarded here and all crypto runs locally (remote stays untrusted).
+    remote: Option<String>,
     name: String,
     mountpoint: PathBuf,
     wipe: bool,
@@ -91,8 +95,38 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
     }
     let dry = ctx.global.effective_dry_run();
 
+    // 0. REMOTE FORWARDING ---------------------------------------------------
+    // A remote disk is untrusted: never ask the far side to decrypt. Forward its
+    // raw LUKS ciphertext here over NBD-over-SSH and run every cryptsetup step
+    // locally. `op_device` is what we actually operate on (a local /dev/nbdN);
+    // `r.device` stays the remote path we record in the config.
+    let mut attachment: Option<crate::blockdev::Attachment> = None;
+    let op_device = match &r.remote {
+        Some(rname) => {
+            let remote = ctx
+                .config
+                .remotes
+                .iter()
+                .find(|rm| &rm.name == rname)
+                .ok_or_else(|| {
+                    Error::new(Code::EConfig, format!("unknown --remote '{rname}'"))
+                        .with_hint("add a matching [[remote]] entry to the config")
+                })?;
+            let att = crate::blockdev::attach_nbd_over_ssh(
+                &ctx.runner,
+                remote,
+                &r.device,
+                crate::blockdev::REMOTE_NBD_PORT + 1000,
+            )?;
+            let dev = att.local_device.clone();
+            attachment = Some(att);
+            dev
+        }
+        None => r.device.clone(),
+    };
+
     // 1. PREFLIGHT / GUARD ---------------------------------------------------
-    let preflight = preflight(ctx, &r.device)?;
+    let preflight = preflight(ctx, &op_device)?;
     let has_data = preflight
         .get("has_data")
         .and_then(|v| v.as_bool())
@@ -118,7 +152,7 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
 
     // The block target we LUKS-format: a fresh partition, an explicit one, or
     // the whole device.
-    let target = resolve_target(ctx, &r, dry)?;
+    let target = resolve_target(ctx, &r, &op_device, dry)?;
 
     // 3. LUKS2 FORMAT + 4. KEY MATERIAL -------------------------------------
     let secure = if dry { None } else { Some(SecureDir::new()?) };
@@ -229,6 +263,7 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
         Err(e) => {
             // Don't leave an unbacked-up volume open after an escrow failure.
             cleanup_mapper(ctx, &mapper);
+            detach_forward(ctx, &attachment);
             return Err(e);
         }
     };
@@ -237,6 +272,7 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
         let captured = !escrow_result.written.is_empty() || (r.emit_secrets && ctx.global.json);
         if !captured && !r.no_backup {
             cleanup_mapper(ctx, &mapper);
+            detach_forward(ctx, &attachment);
             return Err(Error::new(
                 Code::EBackupRefused,
                 "auto mode produced a key with no backup target written",
@@ -274,10 +310,17 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
     // 8. REGISTER + MOUNT ----------------------------------------------------
     let mut registered = false;
     if !r.no_register {
+        // For a remote disk, record the remote path + forwarding transport (not
+        // the ephemeral local /dev/nbdN). This makes it a MANAGED remote:
+        // ciphertext lives there, keys + decryption stay here.
+        let (rec_device, rec_transport) = match &r.remote {
+            Some(_) => (r.device.clone(), Some(crate::config::Transport::Nbd)),
+            None => (target.clone(), None),
+        };
         let disk = Disk {
             name: r.name.clone(),
             uuid: luks_uuid.clone(),
-            device: Some(target.clone()),
+            device: Some(rec_device),
             mapper: None,
             mountpoint: r.mountpoint.clone(),
             fstype: r.fstype.clone(),
@@ -288,8 +331,8 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
             power_off_method: r.power_off_method,
             teardown: crate::config::Teardown::Direct,
             schedule: None,
-            remote: None,
-            transport: None,
+            remote: r.remote.clone(),
+            transport: rec_transport,
         };
         if !dry {
             register_disk(ctx, &disk)?;
@@ -396,6 +439,7 @@ fn resolve(args: &InitArgs) -> Result<Resolved> {
 
     Ok(Resolved {
         device,
+        remote: args.remote.clone().or(spec.remote),
         name,
         mountpoint,
         wipe: args.wipe || spec.wipe.unwrap_or(false),
@@ -564,36 +608,45 @@ fn is_any_mounted(device: &str) -> bool {
 // --- partition + format ----------------------------------------------------
 
 /// Resolve (and create, unless dry-run) the block target to LUKS-format.
-fn resolve_target(ctx: &Context, r: &Resolved, dry: bool) -> Result<String> {
+/// `device` is the local block device to operate on (a forwarded /dev/nbdN for a
+/// remote disk, else the disk itself).
+fn resolve_target(ctx: &Context, r: &Resolved, device: &str, dry: bool) -> Result<String> {
     if let Some(p) = &r.partition {
         return Ok(p.clone());
     }
     if r.no_partition {
-        return Ok(r.device.clone());
+        // Whole-device LUKS: clear any stale signature/partition table first so
+        // the old (e.g. VeraCrypt) header can't be mistaken for live data.
+        if r.wipe {
+            ctx.runner
+                .run(&["wipefs", "-a", device], "wipe existing signatures")?
+                .require("wipefs")?;
+        }
+        return Ok(device.to_string());
     }
     // DEFAULT: fresh GPT with one Linux-LUKS partition spanning the disk.
     if r.wipe {
         ctx.runner
-            .run(&["wipefs", "-a", &r.device], "wipe existing signatures")?
+            .run(&["wipefs", "-a", device], "wipe existing signatures")?
             .require("wipefs")?;
         ctx.runner
-            .run(&["sgdisk", "--zap-all", &r.device], "zap existing GPT/MBR")?
+            .run(&["sgdisk", "--zap-all", device], "zap existing GPT/MBR")?
             .require("sgdisk --zap-all")?;
     }
     ctx.runner
         .run(
-            &["sgdisk", "-n", "1:0:0", "-t", "1:8309", &r.device],
+            &["sgdisk", "-n", "1:0:0", "-t", "1:8309", device],
             "create one Linux-LUKS partition spanning the disk",
         )?
         .require("sgdisk -n")?;
     ctx.runner
-        .run(&["partprobe", &r.device], "reload the partition table")?;
+        .run(&["partprobe", device], "reload the partition table")?;
     if dry {
-        return Ok(partition_path(&r.device));
+        return Ok(partition_path(device));
     }
     // Find the new partition via lsblk (robust across sd*/nvme*/loop*).
     let out = ctx.runner.probe(
-        &["lsblk", "-nro", "NAME,TYPE", &r.device],
+        &["lsblk", "-nro", "NAME,TYPE", device],
         "locate new partition",
     )?;
     for line in out.stdout.lines() {
@@ -604,7 +657,7 @@ fn resolve_target(ctx: &Context, r: &Resolved, dry: bool) -> Result<String> {
             return Ok(format!("/dev/{name}"));
         }
     }
-    Ok(partition_path(&r.device))
+    Ok(partition_path(device))
 }
 
 /// Heuristic partition path: append "p1" when the device name ends in a digit
@@ -691,6 +744,13 @@ fn cleanup_mapper(ctx: &Context, mapper: &str) {
         &["cryptsetup", "close", mapper],
         "close mapping after failure",
     );
+}
+
+/// Tear down a remote ciphertext forward on the failure path (no-op if local).
+fn detach_forward(ctx: &Context, attachment: &Option<crate::blockdev::Attachment>) {
+    if let Some(att) = attachment {
+        let _ = crate::blockdev::detach(&ctx.runner, att);
+    }
 }
 
 // --- escrow ----------------------------------------------------------------

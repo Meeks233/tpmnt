@@ -28,39 +28,88 @@ fn is_mounted(mountpoint: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The backing (ciphertext) device of an open local mapper, via `cryptsetup
+/// status`. For a managed remote disk that's the forwarded `/dev/nbdN`, whose
+/// LUKS header we can then read locally. `None` if the mapper isn't open.
+fn mapper_backing_device(ctx: &Context, mapper: &str) -> Option<String> {
+    let out = ctx
+        .runner
+        .probe(
+            &["cryptsetup", "status", mapper],
+            "resolve mapper backing device",
+        )
+        .ok()?;
+    if !out.ok() {
+        return None;
+    }
+    out.stdout.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("device:")
+            .map(|d| d.trim().to_string())
+    })
+}
+
 pub fn run(ctx: &Context) -> Result<Value> {
     let mut rows = Vec::new();
 
     for disk in &ctx.config.disks {
         let device = disk.device_path();
         let prefix = ctx.config.ssh_prefix_for(disk);
-        let info = luks::inspect_on(&ctx.runner, &prefix, &device).unwrap_or_default();
         let mp = disk.mountpoint.to_string_lossy().to_string();
-
-        // Remote disks: mount/power state come from the remote host; the local-
-        // only management artifacts (crypttab, monitor units, /sys power) don't
-        // apply, so they are reported as null rather than a misleading `false`.
+        let mapper = disk.mapper_name();
         let remote = ctx.config.remote_for(disk);
-        let (physical_device, crypttab, monitored, mounted, powered) = if remote.is_some() {
-            (
+
+        // Where each fact is probed follows the threat-model verdict, not merely
+        // whether the disk is remote. A MANAGED remote disk (ciphertext forwarded,
+        // transport set) is decrypted, mapped, and mounted HERE — only its physical
+        // spindown lives on the far side. A forward-only remote disk lives entirely
+        // on the remote.
+        let local_decrypt = disk.decrypts_locally();
+        let local_mapper_open = std::path::Path::new(&format!("/dev/mapper/{mapper}")).exists();
+
+        // LUKS header: for a locally-decrypting disk read it HERE — via the open
+        // mapper's backing (ciphertext) device when attached, else the recorded
+        // local device. A forward-only remote disk is inspected over SSH.
+        let info = if remote.is_some() && local_decrypt {
+            match mapper_backing_device(ctx, &mapper) {
+                Some(backing) => luks::inspect(&ctx.runner, &backing).unwrap_or_default(),
+                None => luks::inspect(&ctx.runner, &device).unwrap_or_default(),
+            }
+        } else {
+            luks::inspect_on(&ctx.runner, &prefix, &device).unwrap_or_default()
+        };
+
+        let monitor_unit = ctx
+            .paths
+            .systemd_unit_dir()
+            .join(format!("tpmnt-monitor-{}.service", disk.name));
+        let (physical_device, crypttab, monitored, mounted, powered) = match remote {
+            // Managed remote: mapper / mount / monitor units are LOCAL; the
+            // physical disk (spindown) is remote and not tracked via local /sys.
+            Some(_) if local_decrypt => (
+                Value::Null,
+                json!(crypttab_has(ctx, &disk.name)),
+                json!(monitor_unit.exists()),
+                json!(is_mounted(&mp)),
+                json!(local_mapper_open),
+            ),
+            // Forward-only remote: mount/power state come from the remote host;
+            // the local-only management artifacts don't apply, so they are null
+            // rather than a misleading `false`.
+            Some(_) => (
                 Value::Null,
                 Value::Null,
                 Value::Null,
                 json!(remote_mounted(ctx, &prefix, &mp)),
-                json!(remote_powered(ctx, &prefix, &disk.mapper_name())),
-            )
-        } else {
-            let monitor_unit = ctx
-                .paths
-                .systemd_unit_dir()
-                .join(format!("tpmnt-monitor-{}.service", disk.name));
-            (
+                json!(remote_powered(ctx, &prefix, &mapper)),
+            ),
+            None => (
                 json!(power::physical_device_for(&device)),
                 json!(crypttab_has(ctx, &disk.name)),
                 json!(monitor_unit.exists()),
                 json!(is_mounted(&mp)),
                 json!(power::is_powered(disk)),
-            )
+            ),
         };
 
         let mgmt = manage::classify(&ctx.config, disk);

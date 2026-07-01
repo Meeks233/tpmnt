@@ -61,7 +61,7 @@ impl GlobalOpts {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Greenfield: fully-managed initialization of a (possibly blank) disk.
-    Init(InitArgs),
+    Init(Box<InitArgs>),
     /// Authenticate and retrieve a disk's generated key; optionally open it.
     Recover(RecoverArgs),
     /// Temporarily detach a disk (grace unmount + close); data & config kept.
@@ -185,6 +185,13 @@ pub struct InitArgs {
     /// Do not create a filesystem (LUKS container only).
     #[arg(long)]
     pub no_format: bool,
+
+    /// Treat <device> as living on this [[remote]]: the remote is untrusted and
+    /// is never asked to decrypt. Its raw ciphertext is forwarded here over
+    /// NBD-over-SSH and every cryptsetup step runs locally; the disk is
+    /// registered as a managed remote (transport=nbd).
+    #[arg(long)]
+    pub remote: Option<String>,
 
     /// Usage scenario: "cold-standby" (default, auto power-off) or "always-on".
     #[arg(long)]
