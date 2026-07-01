@@ -250,7 +250,9 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
     if !r.no_tpm && !dry {
         let pass = passphrase.clone();
         let enroll =
-            super::enroll::enroll_device(ctx, &target, &r.pcrs, effective_with_pin, || Ok(pass))?;
+            super::enroll::enroll_device(ctx, &target, &r.pcrs, effective_with_pin, false, || {
+                Ok(pass)
+            })?;
         tpm_token = enroll
             .get("tpm2_token_present")
             .and_then(|v| v.as_bool())

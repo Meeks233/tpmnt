@@ -106,6 +106,10 @@ pub enum Command {
     /// Idle watcher for a cold-standby disk (run by its systemd unit).
     #[command(hide = true)]
     Monitor(MonitorArgs),
+    /// Turn a mandatory unlock PIN on/off for already-encrypted disk(s) by
+    /// re-enrolling their TPM2 token. The other entry point is at creation time:
+    /// `init --with-pin` or `[defaults].require_pin`.
+    Pin(PinArgs),
     /// Manage the unified PIN vault (the TPM-independent recovery store):
     /// `list` its disks, `rekey` its PIN, or `sync` it from sealed bundles.
     Vault(VaultArgs),
@@ -525,6 +529,44 @@ pub struct MigrateArgs {
 pub struct RollbackArgs {
     /// The device whose header backup should be restored.
     pub device: String,
+}
+
+#[derive(Args, Debug)]
+pub struct PinArgs {
+    #[command(subcommand)]
+    pub action: PinAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PinAction {
+    /// Enable a mandatory PIN: re-enroll the TPM2 token WITH a PIN (and store the
+    /// key in the PIN vault). Scope: one disk, --all managed disks, or --global.
+    Enable(PinScope),
+    /// Disable the mandatory PIN: re-enroll the TPM2 token WITHOUT a PIN.
+    Disable(PinScope),
+}
+
+#[derive(Args, Debug)]
+pub struct PinScope {
+    /// Disk name to act on. Omit when using --all or --global.
+    pub name: Option<String>,
+
+    /// Apply to every managed disk (leaves [defaults].require_pin as-is).
+    #[arg(long)]
+    pub all: bool,
+    /// Apply to every managed disk AND set/clear [defaults].require_pin, so the
+    /// policy also governs future disks created by init/adopt.
+    #[arg(long)]
+    pub global: bool,
+
+    /// Read the PIN from this file (enable). Else $TPMNT_PIN or a prompt.
+    #[arg(long)]
+    pub pin_file: Option<PathBuf>,
+
+    /// Local port for the NBD-over-SSH tunnel when a remote disk's ciphertext
+    /// must be forwarded here to re-enroll its header.
+    #[arg(long, default_value_t = 21811)]
+    pub local_port: u16,
 }
 
 #[derive(Args, Debug)]

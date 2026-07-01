@@ -63,18 +63,24 @@ pub fn parse_pcrs(spec: Option<&str>) -> Result<Vec<u32>> {
 /// Public entry. Returns a JSON result describing the enrollment.
 pub fn run(ctx: &Context, args: &EnrollArgs) -> Result<Value> {
     let pcrs = parse_pcrs(args.pcrs.as_deref())?;
-    enroll_device(ctx, &args.device, &pcrs, args.with_pin, || {
+    enroll_device(ctx, &args.device, &pcrs, args.with_pin, false, || {
         resolve_passphrase(ctx, args)
     })
 }
 
-/// Reusable enrollment routine (also called by apply/migrate). The passphrase
+/// Reusable enrollment routine (also called by apply/migrate/pin). The passphrase
 /// is fetched lazily so callers that only need a token check pay nothing.
+///
+/// `force` re-enrolls even when a TPM2 token already exists: it wipes the current
+/// TPM2 slot and enrolls a fresh one (this is how a PIN is *added to* or *removed
+/// from* an already-encrypted disk — see `cmd::pin`). Without it, an existing
+/// token short-circuits to a no-op.
 pub fn enroll_device(
     ctx: &Context,
     device: &str,
     pcrs: &[u32],
     with_pin: bool,
+    force: bool,
     passphrase: impl FnOnce() -> Result<String>,
 ) -> Result<Value> {
     let mut warnings: Vec<String> = Vec::new();
@@ -110,8 +116,9 @@ pub fn enroll_device(
         );
     }
 
-    // 5. Already enrolled? Idempotent no-op.
-    if info.has_tpm2_token() {
+    // 5. Already enrolled? Idempotent no-op — unless forcing a re-enroll (e.g. to
+    //    add/remove a PIN on an existing token).
+    if info.has_tpm2_token() && !force {
         for w in &warnings {
             eprintln!("warning: {w}");
         }
@@ -132,7 +139,13 @@ pub fn enroll_device(
 
     // 7. Build and run systemd-cryptenroll.
     let pass = passphrase()?;
-    let mut argv: Vec<String> = vec!["systemd-cryptenroll".into(), "--tpm2-device=auto".into()];
+    let mut argv: Vec<String> = vec!["systemd-cryptenroll".into()];
+    // Re-enrollment: drop the existing TPM2 slot first so the new (PIN / no-PIN)
+    // token replaces it rather than piling up a second one.
+    if force {
+        argv.push("--wipe-slot=tpm2".into());
+    }
+    argv.push("--tpm2-device=auto".into());
     if !pcrs.is_empty() {
         let joined = pcrs
             .iter()
@@ -179,7 +192,7 @@ pub fn enroll_device(
         "ok": true,
         "device": device,
         "uuid": uuid,
-        "action": "enrolled",
+        "action": if force { "re-enrolled" } else { "enrolled" },
         "pcrs": pcrs,
         "with_pin": with_pin,
         "header_backup": backup.display().to_string(),

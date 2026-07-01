@@ -254,7 +254,8 @@ fn adopt_on_device(
     if !args.no_tpm && inspectable {
         let pcrs = super::enroll::parse_pcrs(args.pcrs.as_deref())?;
         let pass = new_pass.clone();
-        let enroll = super::enroll::enroll_device(ctx, device, &pcrs, want_pin, || Ok(pass))?;
+        let enroll =
+            super::enroll::enroll_device(ctx, device, &pcrs, want_pin, false, || Ok(pass))?;
         tpm_token = enroll
             .get("tpm2_token_present")
             .and_then(|v| v.as_bool())

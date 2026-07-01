@@ -51,6 +51,7 @@ pub fn run(ctx: &Context) -> Result<Value> {
                             &device,
                             &disk.pcrs,
                             disk.with_pin,
+                            false,
                             || Ok(std::env::var("PASSWORD").unwrap_or_default()),
                         )?;
                         token_action = "enrolled";

@@ -94,6 +94,9 @@ Power a disk down (default), back up (\-\-on), or set its idle timeouts. Spin\-d
 tpmnt\-schedule(1)
 Apply disks\*(Aq on/off schedule now: power up inside the window, down outside
 .TP
+tpmnt\-pin(1)
+Turn a mandatory unlock PIN on/off for already\-encrypted disk(s) by re\-enrolling their TPM2 token. The other entry point is at creation time: `init \-\-with\-pin` or `[defaults].require_pin`
+.TP
 tpmnt\-vault(1)
 Manage the unified PIN vault (the TPM\-independent recovery store): `list` its disks, `rekey` its PIN, or `sync` it from sealed bundles
 .TP

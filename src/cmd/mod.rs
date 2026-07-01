@@ -11,6 +11,7 @@ pub mod init;
 pub mod migrate;
 pub mod mount_remote;
 pub mod offline;
+pub mod pin;
 pub mod power;
 pub mod recover;
 pub mod remote;

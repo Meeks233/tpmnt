@@ -83,13 +83,16 @@ fn upsert_tagged_line(
 
 /// Build the crypttab line for a disk: TPM2 auto-unlock with a passphrase
 /// fallback (`none` keyfield => systemd asks if TPM fails), `nofail` so a
-/// missing data disk never blocks boot.
+/// missing data disk never blocks boot. A PIN-enrolled disk (`with_pin`) adds
+/// `tpm2-pin=yes` so systemd prompts for the PIN at unlock — without it the TPM
+/// token's PIN requirement would make auto-unlock fail silently.
 pub fn crypttab_line(disk: &Disk) -> String {
-    format!(
-        "{} UUID={} none tpm2-device=auto,nofail",
-        disk.mapper_name(),
-        disk.uuid
-    )
+    let mut opts = String::from("tpm2-device=auto");
+    if disk.with_pin {
+        opts.push_str(",tpm2-pin=yes");
+    }
+    opts.push_str(",nofail");
+    format!("{} UUID={} none {opts}", disk.mapper_name(), disk.uuid)
 }
 
 /// Mount options for a disk. Cold-standby disks get `noatime` so that reads
@@ -324,6 +327,16 @@ mod tests {
         assert_eq!(
             fstab_line(&d),
             "/dev/mapper/tpmnt-data /mnt/data xfs defaults,nofail 0 2"
+        );
+    }
+
+    #[test]
+    fn with_pin_disk_adds_tpm2_pin_to_crypttab() {
+        let mut d = disk();
+        d.with_pin = true;
+        assert_eq!(
+            crypttab_line(&d),
+            "tpmnt-data UUID=1111 none tpm2-device=auto,tpm2-pin=yes,nofail"
         );
     }
 

@@ -72,6 +72,7 @@ fn main() -> ExitCode {
         Command::Remote(a) => cmd::remote::run(&ctx, a),
         Command::MountRemote(a) => cmd::mount_remote::run(&ctx, a),
         Command::UmountRemote(a) => cmd::mount_remote::umount(&ctx, a),
+        Command::Pin(a) => cmd::pin::run(&ctx, a),
         Command::Vault(a) => cmd::vault::run(&ctx, a),
         Command::Power(a) => cmd::power::run(&ctx, a),
         Command::Schedule(a) => cmd::power::schedule(&ctx, a),
@@ -111,6 +112,7 @@ fn render_human(command: &Command, value: &Value) {
         Command::Rename(_) => print!("{}", cmd::rename::render(value)),
         Command::Recover(_) => print!("{}", cmd::recover::render(value)),
         Command::Discover(_) => print!("{}", cmd::discover::render(value)),
+        Command::Pin(_) => print!("{}", cmd::pin::render(value)),
         Command::Vault(_) => print!("{}", cmd::vault::render(value)),
         _ => {
             let action = value.get("action").and_then(|v| v.as_str());

@@ -33,25 +33,26 @@ pub fn run(ctx: &Context, args: &MigrateArgs) -> Result<Value> {
 
         // Re-enroll the local TPM using the portable passphrase keyslot, sourced
         // from the vault when available, else $PASSWORD.
-        let enroll = super::enroll::enroll_device(ctx, &device, &disk.pcrs, disk.with_pin, || {
-            if let Some(v) = &vault_doc {
-                if let Some(p) = vault::get(v, &disk.name)
-                    .and_then(|b| b.get("passphrase"))
-                    .and_then(|x| x.as_str())
-                {
-                    return Ok(p.to_string());
+        let enroll =
+            super::enroll::enroll_device(ctx, &device, &disk.pcrs, disk.with_pin, false, || {
+                if let Some(v) = &vault_doc {
+                    if let Some(p) = vault::get(v, &disk.name)
+                        .and_then(|b| b.get("passphrase"))
+                        .and_then(|x| x.as_str())
+                    {
+                        return Ok(p.to_string());
+                    }
                 }
-            }
-            std::env::var("PASSWORD").map_err(|_| {
-                crate::error::Error::new(
-                    crate::error::Code::ENoPassphrase,
-                    format!(
+                std::env::var("PASSWORD").map_err(|_| {
+                    crate::error::Error::new(
+                        crate::error::Code::ENoPassphrase,
+                        format!(
                         "migrate needs {}'s passphrase: add it to the PIN vault or set $PASSWORD",
                         disk.name
                     ),
-                )
-            })
-        })?;
+                    )
+                })
+            })?;
 
         let changes = reconcile::reconcile_disk(
             &ctx.paths.crypttab(),
