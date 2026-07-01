@@ -75,6 +75,8 @@ pub enum Command {
     Migrate,
     /// Restore a backed-up header and revert config edits for a device.
     Rollback(RollbackArgs),
+    /// List the SSH remotes this machine controls and the disks on each.
+    Remote(RemoteArgs),
     /// Client-side: mount a remote tpmnt-managed dir over sshfs (+ ProxyJump).
     #[command(alias = "client")]
     MountRemote(MountRemoteArgs),
@@ -196,6 +198,15 @@ pub struct InitArgs {
     /// Print a human+machine description of every default and its bypass flag.
     #[arg(long)]
     pub explain: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct RemoteArgs {
+    /// Only show this named remote (default: all).
+    pub name: Option<String>,
+    /// Probe each remote over SSH and report reachability (adds a round-trip).
+    #[arg(long)]
+    pub probe: bool,
 }
 
 #[derive(Args, Debug)]

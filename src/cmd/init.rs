@@ -318,6 +318,7 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
             power_off_method: r.power_off_method,
             teardown: crate::config::Teardown::Direct,
             schedule: None,
+            remote: None,
         };
         if !dry {
             register_disk(ctx, &disk)?;

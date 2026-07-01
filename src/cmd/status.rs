@@ -32,16 +32,42 @@ pub fn run(ctx: &Context) -> Result<Value> {
 
     for disk in &ctx.config.disks {
         let device = disk.device_path();
-        let info = luks::inspect(&ctx.runner, &device).unwrap_or_default();
+        let prefix = ctx.config.ssh_prefix_for(disk);
+        let info = luks::inspect_on(&ctx.runner, &prefix, &device).unwrap_or_default();
         let mp = disk.mountpoint.to_string_lossy().to_string();
-        let monitor_unit = ctx
-            .paths
-            .systemd_unit_dir()
-            .join(format!("tpmnt-monitor-{}.service", disk.name));
+
+        // Remote disks: mount/power state come from the remote host; the local-
+        // only management artifacts (crypttab, monitor units, /sys power) don't
+        // apply, so they are reported as null rather than a misleading `false`.
+        let remote = ctx.config.remote_for(disk);
+        let (physical_device, crypttab, monitored, mounted, powered) = if remote.is_some() {
+            (
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                json!(remote_mounted(ctx, &prefix, &mp)),
+                json!(remote_powered(ctx, &prefix, &disk.mapper_name())),
+            )
+        } else {
+            let monitor_unit = ctx
+                .paths
+                .systemd_unit_dir()
+                .join(format!("tpmnt-monitor-{}.service", disk.name));
+            (
+                json!(power::physical_device_for(&device)),
+                json!(crypttab_has(ctx, &disk.name)),
+                json!(monitor_unit.exists()),
+                json!(is_mounted(&mp)),
+                json!(power::is_powered(disk)),
+            )
+        };
+
         rows.push(json!({
             "name": disk.name,
+            "remote": disk.remote,
+            "host": remote.map(|r| r.host.clone()),
             "device": device,
-            "physical_device": power::physical_device_for(&device),
+            "physical_device": physical_device,
             "mapper": disk.mapper_name(),
             "uuid": disk.uuid,
             "fstype": disk.fstype,
@@ -50,14 +76,14 @@ pub fn run(ctx: &Context) -> Result<Value> {
             "tokens": info.tokens,
             "tpm2_token": info.has_tpm2_token(),
             "non_tpm_fallback": info.has_non_tpm_fallback(),
-            "crypttab": crypttab_has(ctx, &disk.name),
+            "crypttab": crypttab,
             "mountpoint": mp,
-            "mounted": is_mounted(&mp),
+            "mounted": mounted,
             "power_profile": disk.power_profile,
             "idle_timeout_secs": disk.idle_timeout_secs(),
             "teardown": disk.teardown,
-            "monitored": monitor_unit.exists(),
-            "powered": power::is_powered(disk),
+            "monitored": monitored,
+            "powered": powered,
         }));
     }
 
@@ -66,6 +92,30 @@ pub fn run(ctx: &Context) -> Result<Value> {
         "env": ctx.env,
         "disks": rows,
     }))
+}
+
+/// Whether `mountpoint` is an active mount on a remote, via `findmnt` over SSH.
+fn remote_mounted(ctx: &Context, prefix: &[String], mountpoint: &str) -> bool {
+    ctx.runner
+        .probe_on(
+            prefix,
+            &["findmnt", "-rn", "-M", mountpoint],
+            "check remote mount state",
+        )
+        .map(|o| o.ok())
+        .unwrap_or(false)
+}
+
+/// Whether a remote disk's mapper is open (`/dev/mapper/<mapper>` exists there).
+fn remote_powered(ctx: &Context, prefix: &[String], mapper: &str) -> bool {
+    ctx.runner
+        .probe_on(
+            prefix,
+            &["test", "-e", &format!("/dev/mapper/{mapper}")],
+            "check remote mapper (powered) state",
+        )
+        .map(|o| o.ok())
+        .unwrap_or(false)
 }
 
 /// Render the status JSON as a human-readable table.
@@ -291,6 +341,7 @@ pub fn render_dashboard(value: &Value) -> String {
     let mut n_auto = 0;
     let mut n_risk = 0;
     let mut n_mounted = 0;
+    let mut n_remote = 0;
 
     for d in disks {
         let name = s(d, "name");
@@ -320,6 +371,18 @@ pub fn render_dashboard(value: &Value) -> String {
         r.add("uuid     ", GREY).plain(s(d, "uuid"));
         r.add("   mapper ", GREY).plain(s(d, "mapper"));
         out.push_str(&r.finish());
+
+        // -- remote host (the only place a disk's machine is surfaced) -------
+        if let Some(host) = d.get("host").and_then(|v| v.as_str()) {
+            n_remote += 1;
+            let mut r = Row::new(on);
+            r.add("remote   ", GREY);
+            r.add(&format!("⇄ {host}"), CYAN);
+            if let Some(rn) = d.get("remote").and_then(|v| v.as_str()) {
+                r.add(&format!("  [{rn}]"), DIM);
+            }
+            out.push_str(&r.finish());
+        }
 
         // -- encryption posture (the part tpmnt owns) ----------------------
         let luks2 = b(d, "luks2");
@@ -361,9 +424,14 @@ pub fn render_dashboard(value: &Value) -> String {
         if mounted {
             n_mounted += 1;
         }
+        let is_remote = d.get("host").and_then(|v| v.as_str()).is_some();
         let mut r = Row::new(on);
         r.add("system   ", GREY);
-        if b(d, "crypttab") {
+        // crypttab is a local-management artifact; it doesn't apply to a disk
+        // whose crypttab lives on another machine.
+        if is_remote {
+            r.add("⇄ remote-managed", CYAN);
+        } else if b(d, "crypttab") {
             r.add("✓ crypttab", GREEN);
         } else {
             r.add("○ no crypttab", GREY);
@@ -398,7 +466,10 @@ pub fn render_dashboard(value: &Value) -> String {
                 DIM,
             );
             r.plain(" ");
-            if b(d, "monitored") {
+            // Monitoring is a local systemd unit; not tracked for remote disks.
+            if is_remote {
+                r.add("· remote", CYAN);
+            } else if b(d, "monitored") {
                 r.add("· monitored", GREEN);
             } else {
                 r.add("· unmonitored", YELLOW);
@@ -420,6 +491,9 @@ pub fn render_dashboard(value: &Value) -> String {
         n_auto,
         n_mounted,
     ));
+    if n_remote > 0 {
+        out.push_str(&paint(&format!("  ·  ⇄ {n_remote} remote"), CYAN));
+    }
     if n_risk > 0 {
         out.push_str(&paint(
             &format!("  ·  ▲ {n_risk} without fallback key"),
@@ -486,5 +560,25 @@ mod tests {
         std::env::set_var("NO_COLOR", "1");
         let out = render_dashboard(&json!({"disks": []}));
         assert!(out.contains("no disks configured"));
+    }
+
+    #[test]
+    fn dashboard_surfaces_remote_host() {
+        std::env::set_var("NO_COLOR", "1");
+        let mut v = sample();
+        v["disks"][0]["remote"] = json!("nas");
+        v["disks"][0]["host"] = json!("alice@192.168.5.10");
+        // Local-only fields are null for a remote disk.
+        v["disks"][0]["crypttab"] = Value::Null;
+        v["disks"][0]["monitored"] = Value::Null;
+        let out = render_dashboard(&v);
+        // The host is shown (the one place a disk's machine is surfaced)…
+        assert!(out.contains("alice@192.168.5.10"));
+        assert!(out.contains("[nas]"));
+        // …crypttab reads as remote-managed, not a misleading "no crypttab"…
+        assert!(out.contains("remote-managed"));
+        assert!(!out.contains("no crypttab"));
+        // …and the footer counts it.
+        assert!(out.contains("1 remote"));
     }
 }

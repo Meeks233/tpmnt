@@ -17,6 +17,12 @@ pub struct Config {
     pub disks: Vec<Disk>,
     #[serde(default, rename = "remote_mount")]
     pub remote_mounts: Vec<RemoteMount>,
+    /// SSH remotes this machine controls. A [[disk]] with `remote = "<name>"`
+    /// lives on the matching remote; tpmnt runs that disk's operations there
+    /// over SSH, transparently. Which host a disk sits on is surfaced only in
+    /// the dashboard — ordinary disk operations don't require knowing it.
+    #[serde(default, rename = "remote")]
+    pub remotes: Vec<Remote>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +106,81 @@ pub struct Disk {
     /// the disk up inside the window and down outside it (data-safety gated).
     #[serde(default)]
     pub schedule: Option<Schedule>,
+    /// Name of the [[remote]] this disk lives on. Unset = a local disk (the
+    /// default). When set, tpmnt runs this disk's cryptsetup/mount operations on
+    /// that remote over SSH; the disk's `uuid`/`device` are interpreted there.
+    #[serde(default)]
+    pub remote: Option<String>,
+}
+
+/// An SSH-reachable machine tpmnt controls. Purely a connection registry: the
+/// disks it holds are the [[disk]] entries whose `remote` matches `name`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Remote {
+    /// Stable name referenced by `disk.remote`.
+    pub name: String,
+    /// SSH destination: user@addr[:port].
+    pub host: String,
+    /// Optional jump/bastion host(s): user@host[:port]. Comma-separated or
+    /// repeated; routed via SSH `-J` (ProxyJump).
+    #[serde(default)]
+    pub jump: Vec<String>,
+    /// Optional SSH identity (private key) file.
+    #[serde(default)]
+    pub identity: Option<PathBuf>,
+}
+
+impl Remote {
+    /// The SSH argv prefix that runs a command on this remote. Prepended to a
+    /// disk's local argv so `Runner::probe_on` executes it there. Empty jump +
+    /// no identity yields a plain `ssh -o … <host>`.
+    pub fn ssh_prefix(&self) -> Vec<String> {
+        let mut argv = vec![
+            "ssh".to_string(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "ConnectTimeout=8".into(),
+        ];
+        if let Some(id) = &self.identity {
+            argv.push("-o".into());
+            argv.push("IdentitiesOnly=yes".into());
+            argv.push("-i".into());
+            argv.push(expand_tilde(&id.to_string_lossy()));
+        }
+        let jumps: Vec<String> = self
+            .jump
+            .iter()
+            .flat_map(|j| j.split(','))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !jumps.is_empty() {
+            argv.push("-J".into());
+            argv.push(jumps.join(","));
+        }
+        let (host, port) = match self.host.rsplit_once(':') {
+            Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), Some(p.to_string())),
+            _ => (self.host.clone(), None),
+        };
+        if let Some(p) = port {
+            argv.push("-p".into());
+            argv.push(p);
+        }
+        argv.push(host);
+        argv
+    }
+}
+
+/// Expand a leading `~/` to `$HOME` (mirrors mount_remote's helper; kept local
+/// so config has no cross-module dependency).
+fn expand_tilde(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        format!("{home}/{rest}")
+    } else {
+        p.to_string()
+    }
 }
 
 /// A daily wall-clock window during which a disk should be powered on. Outside
@@ -364,6 +445,22 @@ impl Config {
     pub fn to_toml(&self) -> String {
         toml::to_string_pretty(self).unwrap_or_default()
     }
+
+    /// The [[remote]] a disk lives on, if any. None = a local disk (or a
+    /// dangling `remote` name with no matching entry — callers treat that as
+    /// local so a typo can't silently ssh nowhere).
+    pub fn remote_for(&self, disk: &Disk) -> Option<&Remote> {
+        let name = disk.remote.as_deref()?;
+        self.remotes.iter().find(|r| r.name == name)
+    }
+
+    /// SSH argv prefix to run `disk`'s operations on its remote; empty for a
+    /// local disk. Threaded into `Runner::probe_on`/`run_on`.
+    pub fn ssh_prefix_for(&self, disk: &Disk) -> Vec<String> {
+        self.remote_for(disk)
+            .map(Remote::ssh_prefix)
+            .unwrap_or_default()
+    }
 }
 
 fn err_config<T>(path: &Path, e: std::io::Error) -> Result<T> {
@@ -488,5 +585,97 @@ power_off_method = "power-off"
         assert!(d.is_cold_standby());
         assert_eq!(d.idle_timeout_secs(), 600);
         assert_eq!(d.power_off_method, PowerOffMethod::PowerOff);
+    }
+
+    #[test]
+    fn disk_without_remote_is_local() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[disk]]
+name = "d"
+uuid = "u"
+mountpoint = "/mnt/d"
+"#,
+        )
+        .unwrap();
+        let d = &cfg.disks[0];
+        assert!(d.remote.is_none());
+        assert!(cfg.remote_for(d).is_none());
+        assert!(cfg.ssh_prefix_for(d).is_empty());
+    }
+
+    #[test]
+    fn multi_remote_registry_and_disk_association() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[remote]]
+name = "nas"
+host = "alice@192.168.5.10"
+
+[[remote]]
+name = "shed"
+host = "bob@10.0.0.9:2222"
+jump = ["gw@bastion"]
+identity = "/keys/shed"
+
+[[disk]]
+name = "arc"
+uuid = "u1"
+mountpoint = "/mnt/arc"
+remote = "shed"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.remotes.len(), 2);
+        let d = &cfg.disks[0];
+        assert!(d.remote.is_some());
+        let r = cfg.remote_for(d).unwrap();
+        assert_eq!(r.name, "shed");
+
+        // ssh prefix carries identity, jump, and the split-off port.
+        let pfx = cfg.ssh_prefix_for(d);
+        assert_eq!(pfx.first().map(String::as_str), Some("ssh"));
+        assert!(pfx.contains(&"-i".to_string()));
+        assert!(pfx.contains(&"/keys/shed".to_string()));
+        assert!(pfx.contains(&"-J".to_string()));
+        assert!(pfx.contains(&"gw@bastion".to_string()));
+        assert!(pfx.contains(&"-p".to_string()));
+        assert!(pfx.contains(&"2222".to_string()));
+        // host is the last element, port stripped.
+        assert_eq!(pfx.last().map(String::as_str), Some("bob@10.0.0.9"));
+    }
+
+    #[test]
+    fn dangling_remote_name_is_treated_as_local() {
+        // A typo'd remote name must not silently ssh nowhere.
+        let cfg: Config = toml::from_str(
+            r#"
+[[disk]]
+name = "d"
+uuid = "u"
+mountpoint = "/mnt/d"
+remote = "does-not-exist"
+"#,
+        )
+        .unwrap();
+        let d = &cfg.disks[0];
+        assert!(d.remote.is_some());
+        assert!(cfg.remote_for(d).is_none());
+        assert!(cfg.ssh_prefix_for(d).is_empty());
+    }
+
+    #[test]
+    fn plain_remote_no_jump_no_identity() {
+        let r = Remote {
+            name: "nas".into(),
+            host: "alice@192.168.5.10".into(),
+            jump: vec![],
+            identity: None,
+        };
+        let pfx = r.ssh_prefix();
+        assert!(!pfx.contains(&"-J".to_string()));
+        assert!(!pfx.contains(&"-i".to_string()));
+        assert!(!pfx.contains(&"-p".to_string()));
+        assert_eq!(pfx.last().map(String::as_str), Some("alice@192.168.5.10"));
     }
 }

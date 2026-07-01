@@ -8,6 +8,7 @@ pub mod init;
 pub mod migrate;
 pub mod mount_remote;
 pub mod power;
+pub mod remote;
 pub mod rollback;
 pub mod status;
 

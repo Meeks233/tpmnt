@@ -65,6 +65,16 @@ impl Runner {
         self.run_inner(argv, why, true, &[], None)
     }
 
+    /// Like `probe`, but runs `argv` on a remote by prepending `prefix` (an SSH
+    /// argv, e.g. from `Remote::ssh_prefix`). An empty prefix runs locally, so
+    /// callers can pass a disk's prefix uniformly. The full wrapped command is
+    /// what gets traced, so `--plan` shows the real remote invocation.
+    pub fn probe_on(&self, prefix: &[String], argv: &[&str], why: &str) -> Result<Output> {
+        let wrapped = wrap(prefix, argv);
+        let refs: Vec<&str> = wrapped.iter().map(String::as_str).collect();
+        self.run_inner(&refs, why, false, &[], None)
+    }
+
     /// Like `run`, but injects environment variables (e.g. `$PASSWORD` for
     /// systemd-cryptenroll). Env values are NOT recorded in the trace.
     pub fn run_env(&self, argv: &[&str], envs: &[(&str, &str)], why: &str) -> Result<Output> {
@@ -167,6 +177,19 @@ impl Runner {
     }
 }
 
+/// Prepend a remote `prefix` (SSH argv) to a local `argv`. An empty prefix
+/// leaves the command untouched (local execution). The remote command is passed
+/// as a single trailing string so the remote shell re-parses it, matching how
+/// `ssh host cmd arg…` already collapses its trailing words.
+fn wrap(prefix: &[String], argv: &[&str]) -> Vec<String> {
+    if prefix.is_empty() {
+        return argv.iter().map(|s| s.to_string()).collect();
+    }
+    let mut out: Vec<String> = prefix.to_vec();
+    out.extend(argv.iter().map(|s| s.to_string()));
+    out
+}
+
 /// Spawn `cmd` with a piped stdin, write `input`, and collect output.
 fn run_with_stdin(mut cmd: Command, input: &[u8]) -> std::io::Result<std::process::Output> {
     cmd.stdin(Stdio::piped());
@@ -203,5 +226,33 @@ impl Output {
             )
             .with_hint(self.stderr.trim().to_string()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap;
+
+    #[test]
+    fn wrap_empty_prefix_is_local() {
+        assert_eq!(
+            wrap(&[], &["cryptsetup", "luksDump", "/dev/x"]),
+            vec!["cryptsetup".to_string(), "luksDump".into(), "/dev/x".into()]
+        );
+    }
+
+    #[test]
+    fn wrap_prepends_ssh_prefix() {
+        let prefix = vec!["ssh".to_string(), "alice@host".into()];
+        assert_eq!(
+            wrap(&prefix, &["test", "-e", "/dev/mapper/m"]),
+            vec![
+                "ssh".to_string(),
+                "alice@host".into(),
+                "test".into(),
+                "-e".into(),
+                "/dev/mapper/m".into()
+            ]
+        );
     }
 }

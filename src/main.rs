@@ -57,6 +57,7 @@ fn main() -> ExitCode {
         Command::Status | Command::Dashboard => cmd::status::run(&ctx),
         Command::Migrate => cmd::migrate::run(&ctx),
         Command::Rollback(a) => cmd::rollback::run(&ctx, a),
+        Command::Remote(a) => cmd::remote::run(&ctx, a),
         Command::MountRemote(a) => cmd::mount_remote::run(&ctx, a),
         Command::UmountRemote(a) => cmd::mount_remote::umount(&ctx, a),
         Command::Power(a) => cmd::power::run(&ctx, a),
@@ -92,6 +93,7 @@ fn render_human(command: &Command, value: &Value) {
     match command {
         Command::Status => print!("{}", cmd::status::render_table(value)),
         Command::Dashboard => print!("{}", cmd::status::render_dashboard(value)),
+        Command::Remote(_) => print!("{}", cmd::remote::render_table(value)),
         _ => {
             let action = value.get("action").and_then(|v| v.as_str());
             if let Some(a) = action {

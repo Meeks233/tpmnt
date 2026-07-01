@@ -193,6 +193,46 @@ when the remote sshd has no Subsystem (reported as `sftp_path_used`). When an ex
 `--identity` is combined with `--jump`, tpmnt carries the key to every hop via a constructed
 ProxyCommand (plain `-J` does not propagate `-i`).
 
+## Multiple remotes, one control plane
+
+A single machine can drive disks that physically live on **several** SSH-reachable hosts. You
+register each host once as a `[[remote]]`, then tag any `[[disk]]` with `remote = "<name>"`. That
+disk's `uuid`/`device` are interpreted **on that host**, and tpmnt runs its inspection over SSH —
+so `status`/`dashboard` cover local and remote disks in one view without you tracking where each
+one sits. Which machine a disk is on is surfaced **only in the dashboard**; ordinary disk
+operations don't require knowing it.
+
+```toml
+# Two controlled machines and their disks, in the same tpmnt.toml:
+[[remote]]
+name = "nas"
+host = "alice@192.168.5.10"
+
+[[remote]]
+name = "shed"
+host = "bob@10.0.0.9:2222"
+jump = ["gw@bastion"]          # ProxyJump, comma-separate or repeat for multi-hop
+identity = "~/.ssh/id_ed25519"
+
+[[disk]]
+name = "archive"
+uuid = "…"                      # this UUID is resolved on `nas`
+mountpoint = "/mnt/archive"
+remote = "nas"
+power_profile = "cold-standby"
+```
+
+```sh
+tpmnt remote                 # list remotes and the disks remembered on each
+tpmnt remote nas --probe     # + one SSH reachability round-trip per remote
+tpmnt dashboard              # local + remote disks together; remote ones show ⇄ host
+tpmnt status --plan          # see the exact ssh-wrapped commands, run nothing
+```
+
+A `remote` name that matches no `[[remote]]` is treated as **local** (a typo can't silently ssh
+nowhere). Local-only concepts (crypttab, monitor units, `/sys` power state) report `null` for a
+remote disk rather than a misleading `false`; its mount and mapper state are read live over SSH.
+
 ## Power profiles: cold-standby auto power-off (Phase D)
 
 Each `[[disk]]` declares a **usage scenario**. A *cold-standby* (archival/backup) disk that has seen
@@ -314,6 +354,7 @@ sudo tpmnt apply --plan
 | `tpmnt dashboard` | Fancy, TUI-style panels of every disk's tpmnt-managed state (encryption posture, fallback-key lockout risk, mount, cold-standby power). Same JSON as `status` under `--json`. |
 | `tpmnt migrate` | On a new machine: re-enroll the **local** TPM for each disk (unlocked via its portable passphrase), then rebuild crypttab/fstab. |
 | `tpmnt rollback <device>` | Restore the backed-up header and revert tpmnt's config edits. |
+| `tpmnt remote [name]` | List the SSH remotes this machine controls and the disks on each. `--probe` reports per-remote reachability. |
 | `tpmnt mount-remote <name>` | Mount a remote decrypted dir over sshfs via a self-healing systemd --user unit, with optional ProxyJump bastions. |
 | `tpmnt umount-remote <name>` | Stop+disable the unit and unmount. |
 | `tpmnt power <name>` | Spin a disk down now: unmount → `cryptsetup close` → power off the backing disk. |

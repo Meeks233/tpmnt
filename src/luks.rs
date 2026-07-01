@@ -39,18 +39,30 @@ impl LuksInfo {
     }
 }
 
-/// Inspect a device. Read-only; safe under dry-run.
+/// Inspect a local device. Read-only; safe under dry-run.
 pub fn inspect(runner: &Runner, device: &str) -> Result<LuksInfo> {
-    if !Path::new(device).exists() {
+    inspect_on(runner, &[], device)
+}
+
+/// Inspect a device that may live on a remote. `prefix` is an SSH argv (empty =
+/// local, from `Config::ssh_prefix_for`). For remote disks the local existence
+/// check is skipped — the path is resolved on the remote — and `luksDump` runs
+/// there over SSH. Read-only; safe under dry-run.
+pub fn inspect_on(runner: &Runner, prefix: &[String], device: &str) -> Result<LuksInfo> {
+    if prefix.is_empty() && !Path::new(device).exists() {
         return Err(
             Error::new(Code::ENoDevice, format!("device does not exist: {device}"))
                 .with_hint("check the path or `--device by-id` symlink"),
         );
     }
 
-    let out = runner.probe(&["cryptsetup", "luksDump", device], "inspect LUKS header")?;
+    let out = runner.probe_on(
+        prefix,
+        &["cryptsetup", "luksDump", device],
+        "inspect LUKS header",
+    )?;
     if !out.ok() {
-        // Not a LUKS device at all.
+        // Not a LUKS device at all (or unreachable remote).
         return Ok(LuksInfo::default());
     }
     Ok(parse_luks_dump(&out.stdout))

@@ -242,6 +242,7 @@ mod tests {
             power_off_method: crate::config::PowerOffMethod::Auto,
             teardown: crate::config::Teardown::Direct,
             schedule: None,
+            remote: None,
         }
     }
 
