@@ -8,10 +8,14 @@ declarative, portable config. `tpmnt` fills that gap. It is an **orchestrator**:
 the trusted system tools (`cryptsetup`, `systemd-cryptenroll`, `systemd-cryptsetup`) and owns the
 declarative config + idempotent reconciliation around them. It never reimplements cryptography.
 
-> Status: **Phases A–C complete** — `enroll`, `apply`, `status`, `migrate`, `rollback` (A);
+> Status: **Phases A–D complete.** `enroll`, `apply`, `status`, `migrate`, `rollback` (A);
 > whole-disk `init` with key escrow (B); client-side `mount-remote` over sshfs with SSH ProxyJump
-> (C). Verified by automated self-tests including a real cold TPM2 unlock with no passphrase, an
-> age-encrypted escrow round-trip, and a self-healing remote mount through a bastion.
+> (C); cold-standby power + scheduling (D). **v0.2.0** adds two things: **auto-discovery** — a disk
+> is tracked by its LUKS UUID, so tpmnt finds it and keeps it accessible wherever it moves
+> (local ↔ remote ↔ another remote) with decryption always on the trusted local host; and a
+> **mandatory PIN + unified key vault** — one PIN gates TPM2 unlock *and* a single, portable,
+> TPM-independent recovery file holding every disk's key. Verified by automated self-tests and a
+> real end-to-end loopback lifecycle (cold TPM2 unlock, PIN toggle, vault round-trip).
 
 ## Why
 
@@ -103,6 +107,8 @@ one `apt`/`dnf install` from — every distro. None are obscure or version-fragi
 - **always:** `cryptsetup`, `systemd` (provides `systemd-cryptenroll` / `systemd-cryptsetup`), a TPM2 at `/dev/tpmrm0`
 - **`init`:** `gdisk` (sgdisk) + a filesystem tool (`mkfs.xfs` / `mkfs.ext4` / …)
 - **`mount-remote`:** `sshfs` + `fusermount3`
+- **auto-discovery / remote transport:** `blkid` (locate disks by UUID), `qemu-nbd` + `nbd-client` (forward remote ciphertext)
+- **PIN vault:** `gpg` (encrypts the unified recovery vault under your PIN)
 - **optional:** `age` or `gpg` (encrypted key escrow), `hdparm` (power profiles)
 
 ## Quickstart
@@ -185,10 +191,65 @@ sudo tpmnt recover mycache --show
 sudo tpmnt recover mycache --open
 ```
 
-Recovery uses the stored **passphrase**, which opens the LUKS keyslot directly — so no TPM PIN is
-needed even for `--with-pin` disks. Point `--from creds:<file>` / `--from plaintext:<file>` at an
-alternate bundle. To keep the old cleartext behavior, `tpmnt init --local-plaintext
---i-understand-plaintext-keys`.
+Recovery uses the stored **passphrase**, which opens the LUKS keyslot directly. Point
+`--from creds:<file>` / `--from plaintext:<file>` / `--from vault` at an alternate bundle. To keep
+the old cleartext behavior, `tpmnt init --local-plaintext --i-understand-plaintext-keys`.
+
+### The unified PIN vault (TPM-independent recovery)
+
+The host-sealed bundle above is convenient but, by design, unreadable if the **TPM state changes**
+(firmware update, PCR drift) or the host is lost. The **PIN vault** is the complementary escrow: a
+**single file** holding **every** managed disk's key bundle, encrypted under a **PIN** you choose —
+so a broken TPM never means lost data. Type the PIN, get the raw LUKS key back.
+
+- **One file, all keys** — `key_backup/vault.gpg`, keyed by disk name.
+- **Not plaintext, not rainbow-table-able** — encrypted with `gpg --symmetric` using a
+  **salted + iterated** s2k (the random salt defeats precomputed tables; the high iteration count
+  slows brute force) and AES-256. tpmnt never implements crypto — it delegates to `gpg`, chosen over
+  `age -p` because `gpg` takes the PIN from a file descriptor and so works in scripted/headless
+  recovery, not only from a tty.
+- **Written automatically** whenever a PIN is in play (`--with-pin`, or `[defaults].require_pin`), by
+  both `init` and `adopt`.
+
+```sh
+# TPM can't unlock a disk anymore? Recover the raw key with just your PIN:
+sudo tpmnt recover mycache --from vault --show
+# Even the default recover auto-falls back to the vault when the TPM seal can't be read:
+sudo TPMNT_PIN=… tpmnt recover mycache --show      # note on stderr: "recovering from the PIN vault"
+
+# Inspect / maintain the vault (never reveals a key):
+tpmnt vault list                     # which disks are stored (proof-of-retrievability)
+tpmnt vault rekey --new-pin-file f   # change the PIN (decrypt with old, re-encrypt with new)
+tpmnt vault sync                     # (re)build the vault from the local sealed bundles
+```
+
+On a **new machine**, `tpmnt migrate` uses the vault too: one PIN unlocks *every* disk for TPM
+re-enrollment, instead of a per-disk `$PASSWORD`.
+
+### Mandatory PIN
+
+A PIN can be required both **at creation** and **after encryption** — `systemd-cryptenroll` can
+re-enroll an existing LUKS2 TPM2 token at any time (it wipes the TPM2 slot and enrolls a fresh one,
+authorized by the disk's managed passphrase). tpmnt exposes both entry points:
+
+```sh
+# 1. At creation — one disk, or globally as policy:
+sudo tpmnt init /dev/sdb --with-pin …               # this disk needs a PIN
+# [defaults] require_pin = true  in tpmnt.toml       # every init/adopt from now on requires one
+
+# 2. After encryption — flip an already-encrypted disk, per-disk or in bulk:
+sudo tpmnt pin enable mycache                        # add a PIN to one managed disk
+sudo tpmnt pin enable --all                          # every managed disk
+sudo tpmnt pin enable --global                       # + set [defaults].require_pin for future disks
+sudo tpmnt pin disable mycache                       # remove it again (re-enroll without a PIN)
+```
+
+`pin enable` re-enrolls the TPM2 token **with** a PIN, writes `tpm2-pin=yes` into crypttab so
+systemd prompts for it at unlock, and drops the key into the PIN vault. The **same PIN** gates the
+TPM and encrypts the vault, so there's only one thing to remember. Remote managed disks are handled
+identically — their ciphertext is forwarded here (NBD-over-SSH) so the re-enrollment runs locally.
+The PIN comes from `--pin-file`, `$TPMNT_PIN`, or a prompt. (For a **root** disk, rebuild the
+initramfs so the PIN prompt applies at boot.)
 
 ## Taking a disk offline vs. destroying it
 
@@ -350,6 +411,29 @@ remote = "nas"
 transport = "nbd"     # forward ciphertext here, decrypt locally → managed
 ```
 
+## Auto-discovery: a disk is where its UUID is
+
+A disk is identified by its stable **LUKS2 UUID**, never by a device path or a host — because both
+change when you physically move it. Pull an archive drive out of the NAS and plug it into your
+laptop, or shuttle it from one remote to another: **you don't have to reconfigure anything**.
+`tpmnt discover` probes every candidate location for the disk's UUID (locally via `blkid`, then each
+`[[remote]]` over SSH) and rebinds the config to wherever it actually is — always keeping decryption
+on **this** trusted host:
+
+- found **locally** → `remote`/`transport` cleared, resolved via the stable `/dev/disk/by-uuid/…`;
+- found on a **remote** → `remote`/`device` re-pointed, `transport = nbd` so its ciphertext is
+  forwarded here and `cryptsetup open` still runs locally.
+
+```sh
+tpmnt discover              # re-locate every disk and rebind if it moved (idempotent)
+tpmnt discover archive      # just one; aliases: `scan`, `locate`
+tpmnt discover --plan       # probe read-only, show where each disk is, change nothing
+```
+
+Discovery runs **automatically at the start of `apply`**, so ordinary use never has to think about
+it — the whole point is that you don't know or care where a disk currently sits (only the dashboard
+surfaces it). A disk that isn't found anywhere is left untouched (it's just unplugged).
+
 ## Power profiles: cold-standby auto power-off (Phase D)
 
 Each `[[disk]]` declares a **usage scenario**. A *cold-standby* (archival/backup) disk that has seen
@@ -466,14 +550,17 @@ sudo tpmnt apply --plan
 |---|---|
 | `tpmnt init <device>` | Greenfield whole-disk init: partition → LUKS2 → keys → escrow → TPM2 → fs → register + mount. Safe-by-default, every step bypassable. `--explain` lists all defaults. |
 | `tpmnt adopt <name…>` | Take ownership of existing disk(s): rotate in a fresh locally-generated managed key (auth'd by the old key), enroll this host's TPM2, seal the bundle, optionally `--rotate-out-old`. Remote disks are forwarded here via NBD-over-SSH so keys/decryption stay local. Flips the disk to **managed**. |
-| `tpmnt recover <name>` | Authenticate (root + this host's TPM) and retrieve a disk's generated key from the sealed store. `--show` reveals it; `--open` unlocks the LUKS mapping now for when TPM auto-unlock is broken. |
+| `tpmnt recover <name>` | Authenticate (root + this host's TPM) and retrieve a disk's generated key. `--show` reveals it; `--open` unlocks the mapping now. Sources: the sealed store (default), `--from vault` (PIN-encrypted), or `--from creds:/plaintext:<file>` — and the default **auto-falls back to the PIN vault** when the TPM seal can't be read. |
+| `tpmnt pin enable\|disable [<name>]` | Turn a mandatory unlock PIN on/off for already-encrypted disk(s) by re-enrolling the TPM2 token. Scope: one disk, `--all` managed disks, or `--global` (also sets/clears `[defaults].require_pin`). Reconciles `tpm2-pin=yes` in crypttab and stores the key in the PIN vault. |
+| `tpmnt vault list\|rekey\|sync` | Manage the unified PIN vault (the TPM-independent recovery store): `list` its disks (no secrets), `rekey` its PIN, or `sync` it from the local sealed bundles. |
+| `tpmnt discover [name…]` | Re-locate each disk by its LUKS UUID and rebind the config if it moved (local ↔ remote ↔ another remote). Runs automatically inside `apply`. Aliases: `scan`, `locate`. |
 | `tpmnt offline <name>` | Temporarily detach a disk: grace unmount → `cryptsetup close` (ciphertext at rest). Data **and** config are kept, so it can be brought back later. `--force` lazily detaches a busy mount. Remote disks are torn down over SSH. |
 | `tpmnt destroy <name>` | Permanently drop a disk's local management (config, crypttab/fstab, units, key bundles, header backup). Requires `--yes` (even for AI). **Does not format** — the LUKS ciphertext is left intact; reformat later if you need the space. |
 | `tpmnt enroll <device>` | Back up the LUKS2 header, then enroll a TPM2 token via `systemd-cryptenroll`. Refuses TPM-only setups that have no passphrase fallback. |
 | `tpmnt apply` | Idempotently reconcile crypttab + the mount backend (fstab or systemd `.mount`) to the TOML. |
 | `tpmnt status` | Per disk: LUKS2? TPM2 token? crypttab entry? mounted? Plus environment detection. |
 | `tpmnt dashboard` | Fancy, TUI-style panels of every disk's tpmnt-managed state (encryption posture, fallback-key lockout risk, mount, cold-standby power). Same JSON as `status` under `--json`. |
-| `tpmnt migrate` | On a new machine: re-enroll the **local** TPM for each disk (unlocked via its portable passphrase), then rebuild crypttab/fstab. |
+| `tpmnt migrate` | On a new machine: re-enroll the **local** TPM for each disk, then rebuild crypttab/fstab. With a PIN vault present, **one PIN unlocks every disk** (`--pin-file`); otherwise each falls back to its portable passphrase via `$PASSWORD`. |
 | `tpmnt rollback <device>` | Restore the backed-up header and revert tpmnt's config edits. |
 | `tpmnt remote [name]` | List the SSH remotes this machine controls and the disks on each. `--probe` reports per-remote reachability. |
 | `tpmnt mount-remote <name>` | Mount a remote decrypted dir over sshfs via a self-healing systemd --user unit, with optional ProxyJump bastions. |

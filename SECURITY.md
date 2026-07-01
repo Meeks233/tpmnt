@@ -40,7 +40,9 @@ Further reading: oddlama, *Bypassing disk encryption with TPM2 unlock*
 ## What tpmnt does to stay safe
 
 - **Header backup before any keyslot change** (`cryptsetup luksHeaderBackup`); `tpmnt rollback`
-  restores it.
+  restores it. The backup is idempotent per UUID: the **first** (pristine, pre-management) header is
+  preserved and never overwritten by a later re-enroll (e.g. `tpmnt pin enable`), so rollback always
+  restores the original.
 - **Idempotent, reversible config edits**: crypttab/fstab/unit edits are tagged and `.bak`'d; a
   re-run is a no-op.
 - **No silent failures**: LUKS1, missing TPM, weak policy, and bad config each map to a stable,
@@ -70,6 +72,32 @@ recoverable — an auto-generated key that is never captured is unrecoverable on
   in `--json` only with the explicit `--emit-secrets` opt-in; otherwise only fingerprints/locations.
 
 **Copy at least one escrow bundle off-machine.** The escrow dir lives on the same host as the disk.
+
+## The PIN vault (TPM-independent recovery)
+
+The host-sealed bundle (`systemd-creds`, above) is bound to *this* host's TPM by design — which
+means it is unrecoverable if the TPM state changes or the host dies. The **PIN vault** is the
+complementary escrow that survives both: a **single file** (`key_backup/vault.gpg`) holding every
+managed disk's key bundle, encrypted under a user-chosen **PIN**.
+
+- **Delegated crypto, never rolled here.** The vault is encrypted with `gpg --symmetric`
+  (AES-256). tpmnt does not implement any cipher or KDF.
+- **Hardened against precomputation and brute force.** gpg's string-to-key is **salted +
+  iterated** (mode 3): the random per-file salt makes rainbow tables useless, and a high iteration
+  count (`--s2k-count`) slows each guess. `gpg` is chosen over `age -p` specifically because it
+  reads the PIN from a file descriptor, so scripted/headless recovery works — not only a tty.
+- **Never plaintext at rest.** The vault plaintext exists only in a `0700` tmpfs `SecureDir` for
+  the duration of a single `gpg` call; the on-disk file is `0600` ASCII-armored ciphertext.
+- **PIN strength matters here.** Unlike the TPM PIN (rate-limited *in hardware*), the vault is an
+  *offline* target: anyone who copies `vault.gpg` can attempt PIN guesses at their own pace. The
+  salted+iterated s2k raises the cost per guess, but a weak PIN is still a weak PIN. Use a
+  reasonably strong PIN (tpmnt enforces a minimum length), and treat `vault.gpg` as sensitive —
+  it is exactly as strong as the PIN protecting it. It is safe to copy off-machine for recovery.
+- **One PIN, two jobs.** The same PIN gates TPM2 unlock (`--tpm2-with-pin`) and encrypts the vault,
+  so there is a single secret to remember. `tpmnt recover --from vault` (or the default recover,
+  which auto-falls back to the vault when the TPM seal is unreadable) returns the raw LUKS key on
+  the correct PIN; `tpmnt vault rekey` rotates the vault PIN (the TPM PIN is rotated separately via
+  a re-enroll).
 
 ## Remote mounts over SSH (`tpmnt mount-remote`)
 
