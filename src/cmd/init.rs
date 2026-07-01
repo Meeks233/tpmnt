@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use crate::cli::InitArgs;
 use crate::config::{Config, Disk};
 use crate::error::{err, Code, Error, Result};
+use crate::keystore::{self, SecureDir};
 use crate::reconcile;
 use crate::secret;
 
@@ -63,6 +64,7 @@ struct Resolved {
     no_recovery_key: bool,
     i_understand_no_recovery: bool,
     escrow: Vec<String>,
+    local_plaintext: bool,
     no_backup: bool,
     emit_secrets: bool,
     no_tpm: bool,
@@ -76,49 +78,17 @@ struct Resolved {
     power_off_method: crate::config::PowerOffMethod,
 }
 
-/// RAII guard: a private dir for keyfiles, removed on drop.
-struct SecureDir {
-    path: PathBuf,
-}
-
-impl SecureDir {
-    fn new() -> Result<SecureDir> {
-        // Prefer tmpfs (/dev/shm) so secrets never touch persistent storage.
-        let base = if Path::new("/dev/shm").is_dir() {
-            PathBuf::from("/dev/shm")
-        } else {
-            std::env::temp_dir()
-        };
-        let path = base.join(format!("tpmnt-keys-{}", std::process::id()));
-        std::fs::create_dir_all(&path)
-            .map_err(|e| Error::new(Code::EInternal, format!("mkdir securedir: {e}")))?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| Error::new(Code::EInternal, format!("chmod securedir: {e}")))?;
-        Ok(SecureDir { path })
-    }
-
-    /// Write a secret to a 0600 keyfile and return its path.
-    fn write_key(&self, name: &str, secret: &str) -> Result<PathBuf> {
-        let p = self.path.join(name);
-        std::fs::write(&p, secret.as_bytes())
-            .map_err(|e| Error::new(Code::EInternal, format!("write keyfile: {e}")))?;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| Error::new(Code::EInternal, format!("chmod keyfile: {e}")))?;
-        Ok(p)
-    }
-}
-
-impl Drop for SecureDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
 pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
     if args.explain {
         return Ok(explain());
     }
     let r = resolve(args)?;
+    if r.local_plaintext && !args.i_understand_plaintext_keys {
+        return err(
+            Code::EBackupRefused,
+            "--local-plaintext requires --i-understand-plaintext-keys",
+        );
+    }
     let dry = ctx.global.effective_dry_run();
 
     // 1. PREFLIGHT / GUARD ---------------------------------------------------
@@ -451,6 +421,7 @@ fn resolve(args: &InitArgs) -> Result<Resolved> {
         } else {
             spec.escrow.unwrap_or_default()
         },
+        local_plaintext: args.local_plaintext,
         no_backup: args.i_understand_no_backup || spec.no_backup.unwrap_or(false),
         emit_secrets: args.emit_secrets,
         no_tpm: args.no_tpm || spec.no_tpm.unwrap_or(false),
@@ -760,18 +731,25 @@ fn run_escrow(ctx: &Context, r: &Resolved, bundle_json: &str, dry: bool) -> Resu
     let mut written = Vec::new();
     let dir = &ctx.config.defaults.key_backup;
 
-    // Plaintext bundle (default target).
+    // Local bundle (default target). Sealed to the host's TPM via systemd-creds
+    // unless the operator explicitly opted into cleartext with --local-plaintext.
     if !r.no_backup {
-        let path = dir.join(format!("{}.json", r.name));
-        if !dry {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| Error::new(Code::EEscrowFailed, format!("mkdir key_backup: {e}")))?;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).ok();
-            std::fs::write(&path, bundle_json)
-                .map_err(|e| Error::new(Code::EEscrowFailed, format!("write bundle: {e}")))?;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
+        if r.local_plaintext {
+            let path = dir.join(format!("{}.json", r.name));
+            if !dry {
+                std::fs::create_dir_all(dir).map_err(|e| {
+                    Error::new(Code::EEscrowFailed, format!("mkdir key_backup: {e}"))
+                })?;
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).ok();
+                std::fs::write(&path, bundle_json)
+                    .map_err(|e| Error::new(Code::EEscrowFailed, format!("write bundle: {e}")))?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
+            }
+            written.push(json!({ "type": "plaintext", "path": path }));
+        } else {
+            let path = keystore::seal(&ctx.runner, dir, &r.name, bundle_json.as_bytes(), dry)?;
+            written.push(json!({ "type": "sealed", "path": path }));
         }
-        written.push(json!({ "type": "plaintext", "path": path }));
     }
 
     // Encrypted escrow targets.
@@ -903,13 +881,23 @@ fn register_disk(ctx: &Context, disk: &Disk) -> Result<()> {
 
 fn next_steps(r: &Resolved, escrow: &EscrowResult) -> Vec<String> {
     let mut steps = Vec::new();
-    if escrow
-        .written
-        .iter()
-        .any(|w| w.get("type").and_then(|t| t.as_str()) == Some("plaintext"))
-    {
+    let has = |t: &str| {
+        escrow
+            .written
+            .iter()
+            .any(|w| w.get("type").and_then(|v| v.as_str()) == Some(t))
+    };
+    if has("plaintext") {
         steps.push(
             "Copy the plaintext key bundle off this machine to secure offline storage.".into(),
+        );
+    }
+    if has("sealed") {
+        steps.push(
+            "Local key bundle is sealed to this host's TPM; it can't be read on another machine. \
+             Add an offline --escrow target (age/gpg) for disaster recovery, and retrieve it here \
+             with `tpmnt recover <name>`."
+                .into(),
         );
     }
     if r.no_tpm {
@@ -932,7 +920,7 @@ fn explain() -> Value {
             { "step": "luks", "default": "luks2 aes-xts-plain64 / argon2id / auto sector / 512-bit", "bypass": "--cipher --kdf --sector-size --label" },
             { "step": "key", "default": "auto diceware passphrase", "bypass": "--key-format base64 | --passphrase-file | --passphrase-stdin" },
             { "step": "recovery", "default": "add a recovery key", "bypass": "--no-recovery-key --i-understand-no-recovery" },
-            { "step": "escrow", "default": "plaintext bundle to key_backup", "bypass": "--escrow age:|gpg:|pass: | --i-understand-no-backup | --emit-secrets" },
+            { "step": "escrow", "default": "sealed (systemd-creds/TPM2) bundle to key_backup", "bypass": "--escrow age:|gpg:|pass: | --local-plaintext | --i-understand-no-backup | --emit-secrets" },
             { "step": "tpm", "default": "enroll TPM2 (warn on PCR-only)", "bypass": "--no-tpm | --pcrs | --with-pin" },
             { "step": "filesystem", "default": "mkfs.xfs", "bypass": "--fstype <t> | --no-format" },
             { "step": "register", "default": "add [[disk]] + apply + mount", "bypass": "--no-register | --mountpoint | --name" }

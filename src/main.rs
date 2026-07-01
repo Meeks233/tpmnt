@@ -6,6 +6,7 @@ mod config;
 mod env;
 mod error;
 mod exec;
+mod keystore;
 mod luks;
 mod paths;
 mod power;
@@ -52,6 +53,7 @@ fn main() -> ExitCode {
 
     let result: Result<Value> = match &cli.command {
         Command::Init(a) => cmd::init::run(&ctx, a),
+        Command::Recover(a) => cmd::recover::run(&ctx, a),
         Command::Enroll(a) => cmd::enroll::run(&ctx, a),
         Command::Apply => cmd::apply::run(&ctx),
         Command::Status | Command::Dashboard => cmd::status::run(&ctx),
@@ -94,6 +96,7 @@ fn render_human(command: &Command, value: &Value) {
         Command::Status => print!("{}", cmd::status::render_table(value)),
         Command::Dashboard => print!("{}", cmd::status::render_dashboard(value)),
         Command::Remote(_) => print!("{}", cmd::remote::render_table(value)),
+        Command::Recover(_) => print!("{}", cmd::recover::render(value)),
         _ => {
             let action = value.get("action").and_then(|v| v.as_str());
             if let Some(a) = action {

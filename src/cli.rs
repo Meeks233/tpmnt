@@ -62,6 +62,8 @@ impl GlobalOpts {
 pub enum Command {
     /// Greenfield: fully-managed initialization of a (possibly blank) disk.
     Init(InitArgs),
+    /// Authenticate and retrieve a disk's generated key; optionally open it.
+    Recover(RecoverArgs),
     /// Enroll TPM2 on an existing LUKS2 device (asks for the passphrase once).
     Enroll(EnrollArgs),
     /// Idempotently reconcile the system (crypttab/fstab/units) to the config.
@@ -143,10 +145,17 @@ pub struct InitArgs {
     pub i_understand_no_recovery: bool,
 
     /// Escrow target(s): age:<pubkey> | gpg:<recipient> | pass:<store-path>.
-    /// Repeatable. The plaintext bundle dir (key_backup) is always written too
+    /// Repeatable. A sealed local bundle (key_backup) is always written too
     /// unless --i-understand-no-backup.
     #[arg(long = "escrow")]
     pub escrow: Vec<String>,
+    /// Store the local key bundle in CLEARTEXT (old behavior) instead of sealing
+    /// it to the TPM with systemd-creds. Requires --i-understand-plaintext-keys.
+    #[arg(long)]
+    pub local_plaintext: bool,
+    /// Acknowledge writing the local key bundle in cleartext.
+    #[arg(long)]
+    pub i_understand_plaintext_keys: bool,
     /// Finish even if no key bundle could be backed up (loud, recorded).
     #[arg(long)]
     pub i_understand_no_backup: bool,
@@ -198,6 +207,27 @@ pub struct InitArgs {
     /// Print a human+machine description of every default and its bypass flag.
     #[arg(long)]
     pub explain: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct RecoverArgs {
+    /// Name of the [[disk]] whose key bundle to retrieve.
+    pub name: String,
+
+    /// Reveal the recovered secrets (passphrase + recovery key). Without this,
+    /// only proof-of-retrievability metadata is printed — never the key.
+    #[arg(long)]
+    pub show: bool,
+
+    /// Manually open the LUKS mapping now using the recovered key (for when TPM
+    /// auto-unlock is broken). Local disks only.
+    #[arg(long)]
+    pub open: bool,
+
+    /// Alternate bundle source: creds:<file> (sealed) | plaintext:<file>.
+    /// Default: the sealed <name>.cred under key_backup.
+    #[arg(long)]
+    pub from: Option<String>,
 }
 
 #[derive(Args, Debug)]

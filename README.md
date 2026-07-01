@@ -146,8 +146,9 @@ sudo tpmnt init /dev/sdb \
   --name mycache --mountpoint /srv/mycache \
   --escrow age:age1qz...your-pubkey... \
   --pcrs 7,14 --with-pin
-# Writes the plaintext key bundle to key_backup AND an age-encrypted copy; refuses to finish
-# in auto mode unless at least one backup target was captured (E_BACKUP_REFUSED otherwise).
+# Seals the key bundle to this host's TPM (systemd-creds) in key_backup AND writes an
+# age-encrypted offline copy; refuses to finish in auto mode unless at least one backup
+# target was captured (E_BACKUP_REFUSED otherwise).
 ```
 
 ```sh
@@ -163,6 +164,31 @@ Safety gates: refuses any disk that already has data unless `--wipe --yes`
 (`E_DEVICE_HAS_DATA`); refuses to leave an unbacked-up volume after a failed escrow target
 (`E_ESCROW_FAILED`); `--plan` prints the full ordered JSON plan and touches nothing. Drive an
 entire init from a single TOML with `--from-config <file>`.
+
+## Key storage & recovery
+
+Auto-generated LUKS keys are **never written to disk in cleartext by default**. The local key
+bundle (primary passphrase + recovery key) is sealed with **`systemd-creds`**, which binds it to
+this host's **TPM2** (falling back to the root-only host key when no TPM is present). Decryption
+therefore requires the same machine *and* root — a convenient local credential with nothing to
+remember. Portable `--escrow age:/gpg:/pass:` copies are for the disaster case where the host
+itself is lost, which a host-bound seal deliberately can't cover.
+
+```sh
+# Prove the key is retrievable (no secret printed):
+sudo tpmnt recover mycache
+
+# Reveal the key material (root + this host's TPM required to unseal):
+sudo tpmnt recover mycache --show
+
+# TPM auto-unlock broke after a firmware update? Open the mapping manually with the stored key:
+sudo tpmnt recover mycache --open
+```
+
+Recovery uses the stored **passphrase**, which opens the LUKS keyslot directly — so no TPM PIN is
+needed even for `--with-pin` disks. Point `--from creds:<file>` / `--from plaintext:<file>` at an
+alternate bundle. To keep the old cleartext behavior, `tpmnt init --local-plaintext
+--i-understand-plaintext-keys`.
 
 ## Remote mounts with jump hosts (Phase C)
 
@@ -348,6 +374,7 @@ sudo tpmnt apply --plan
 | Command | Purpose |
 |---|---|
 | `tpmnt init <device>` | Greenfield whole-disk init: partition → LUKS2 → keys → escrow → TPM2 → fs → register + mount. Safe-by-default, every step bypassable. `--explain` lists all defaults. |
+| `tpmnt recover <name>` | Authenticate (root + this host's TPM) and retrieve a disk's generated key from the sealed store. `--show` reveals it; `--open` unlocks the LUKS mapping now for when TPM auto-unlock is broken. |
 | `tpmnt enroll <device>` | Back up the LUKS2 header, then enroll a TPM2 token via `systemd-cryptenroll`. Refuses TPM-only setups that have no passphrase fallback. |
 | `tpmnt apply` | Idempotently reconcile crypttab + the mount backend (fstab or systemd `.mount`) to the TOML. |
 | `tpmnt status` | Per disk: LUKS2? TPM2 token? crypttab entry? mounted? Plus environment detection. |
