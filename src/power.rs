@@ -420,16 +420,61 @@ fn spindown_impl(ctx: &Context, disk: &Disk, soft: bool) -> Result<SpinOutcome> 
 /// Bring a scheduled disk up: open (TPM2 token) + mount, mirroring the disk's
 /// teardown mode so the pairing is symmetric. Idempotent — already-open /
 /// already-mounted steps are skipped.
+/// The LOCAL block device to `cryptsetup open` for this disk. A local disk uses
+/// its configured container path directly. A remote disk's ciphertext is
+/// forwarded here as a `/dev/nbdN`, so the config `device` (which names the disk
+/// on its *remote* host, e.g. `/dev/sda`) can't be opened locally — instead we
+/// find the already-attached nbd device whose LUKS header UUID matches. This is
+/// the spin-up counterpart to spindown's remote `hdparm` power-off: teardown
+/// leaves the forward live, so spin-up just re-opens the forwarded ciphertext.
+fn local_container(ctx: &Context, disk: &Disk) -> Result<String> {
+    if ctx.config.ssh_prefix_for(disk).is_empty() {
+        return Ok(disk.device_path());
+    }
+    for n in 0..16 {
+        // Only attached nbd devices report a non-zero size; skip the rest cheaply.
+        match std::fs::read_to_string(format!("/sys/block/nbd{n}/size")) {
+            Ok(s) if s.trim() != "0" => {}
+            _ => continue,
+        }
+        let dev = format!("/dev/nbd{n}");
+        if let Ok(out) = ctx.runner.probe(
+            &["cryptsetup", "luksUUID", &dev],
+            "identify forwarded NBD device by LUKS UUID",
+        ) {
+            if out.ok() && out.stdout.trim() == disk.uuid {
+                return Ok(dev);
+            }
+        }
+    }
+    // Under --plan/--dry-run the forward may legitimately be absent; fall back to
+    // the config path so the plan still renders instead of hard-failing.
+    if ctx.global.effective_dry_run() {
+        return Ok(disk.device_path());
+    }
+    Err(Error::new(
+        Code::ETransport,
+        format!(
+            "no forwarded NBD device carries '{}' (uuid {}); ciphertext is not attached locally",
+            disk.name, disk.uuid
+        ),
+    )
+    .with_hint("re-establish the ciphertext forward (`tpmnt apply`/`adopt`), then retry power-on"))
+}
+
 pub fn spinup(ctx: &Context, disk: &Disk) -> Result<Value> {
     let dry = ctx.global.effective_dry_run();
     let mapper = disk.mapper_name();
     let mapper_dev = format!("/dev/mapper/{mapper}");
-    let container = disk.device_path();
     let mp = disk.mountpoint.to_string_lossy().to_string();
     let mut steps: Vec<Value> = Vec::new();
 
     match disk.teardown {
         Teardown::Direct => {
+            // The container to open lives *here*: a local disk at its configured
+            // path, a remote disk at the local NBD device forwarding its
+            // ciphertext (the config `device` names it on the *remote* host).
+            let container = local_container(ctx, disk)?;
             if Path::new(&mapper_dev).exists() && !dry {
                 steps.push(
                     json!({"step": "cryptsetup-open", "mapper": mapper, "skipped": "already open"}),
