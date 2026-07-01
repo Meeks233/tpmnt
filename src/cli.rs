@@ -186,7 +186,7 @@ pub struct InitArgs {
     #[arg(long)]
     pub no_format: bool,
 
-    /// Usage scenario: "always-on" (default) or "cold-standby" (auto power-off).
+    /// Usage scenario: "cold-standby" (default, auto power-off) or "always-on".
     #[arg(long)]
     pub power_profile: Option<String>,
     /// Idle window before a cold-standby disk powers off (e.g. "5min", "30s").

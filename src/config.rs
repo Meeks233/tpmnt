@@ -85,8 +85,8 @@ pub struct Disk {
     pub pcrs: Vec<u32>,
     #[serde(default)]
     pub with_pin: bool,
-    /// Usage scenario. `always-on` (default) is never touched; `cold-standby`
-    /// disks are spun down/powered off after `idle_timeout` with no real access.
+    /// Usage scenario. `cold-standby` (default) disks are spun down/powered off
+    /// after `idle_timeout` with no real access; `always-on` is never touched.
     #[serde(default)]
     pub power_profile: PowerProfile,
     /// Idle window before a cold-standby disk powers off. Accepts "5min",
@@ -342,10 +342,11 @@ pub enum Teardown {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PowerProfile {
-    /// Continuous use: tpmnt never spins the disk down (default).
-    #[default]
+    /// Continuous use: tpmnt never spins the disk down.
     AlwaysOn,
-    /// Cold backup/archival: auto power-off after an idle window.
+    /// Cold backup/archival: auto power-off after an idle window (default).
+    /// A disk that doesn't declare a profile is treated as cold-standby.
+    #[default]
     ColdStandby,
 }
 
@@ -566,7 +567,8 @@ mod tests {
 
     #[test]
     fn power_profile_defaults_are_back_compatible() {
-        // A disk table without the new keys must still parse.
+        // A disk table without the new keys must still parse. An undeclared
+        // profile defaults to cold-standby.
         let cfg: Config = toml::from_str(
             r#"
 [[disk]]
@@ -577,8 +579,8 @@ mountpoint = "/mnt/d"
         )
         .unwrap();
         let d = &cfg.disks[0];
-        assert_eq!(d.power_profile, PowerProfile::AlwaysOn);
-        assert!(!d.is_cold_standby());
+        assert_eq!(d.power_profile, PowerProfile::ColdStandby);
+        assert!(d.is_cold_standby());
         assert_eq!(d.idle_timeout_secs(), 300);
         assert_eq!(d.power_off_method, PowerOffMethod::Auto);
     }
