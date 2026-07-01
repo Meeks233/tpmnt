@@ -135,7 +135,6 @@ pub fn run(ctx: &Context) -> Result<Value> {
             "mounted": mounted,
             "power_profile": disk.power_profile,
             "standby_timeout_secs": disk.standby_timeout_secs(&ctx.config.defaults),
-            "poweroff_timeout_secs": disk.poweroff_timeout_secs(&ctx.config.defaults),
             "teardown": disk.teardown,
             "monitored": monitored,
             "powered": powered,
@@ -569,11 +568,7 @@ pub fn render_dashboard(value: &Value) -> String {
         if cold {
             r.plain("   ");
             r.add(
-                &format!(
-                    "standby {} · off {}",
-                    fmt_idle(u(d, "standby_timeout_secs")),
-                    fmt_idle(u(d, "poweroff_timeout_secs"))
-                ),
+                &format!("standby {}", fmt_idle(u(d, "standby_timeout_secs"))),
                 DIM,
             );
             r.plain(" ");
@@ -637,8 +632,7 @@ mod tests {
                 "tokens": ["systemd-tpm2"], "tpm2_token": true,
                 "non_tpm_fallback": true, "crypttab": true,
                 "mountpoint": "/mnt/backup", "mounted": false,
-                "power_profile": "cold-standby",
-                "standby_timeout_secs": 300, "poweroff_timeout_secs": 1800,
+                "power_profile": "cold-standby", "standby_timeout_secs": 600,
                 "teardown": "direct", "monitored": true, "powered": false,
                 "management": {
                     "managed": true, "reason": "managed",
@@ -658,7 +652,7 @@ mod tests {
         assert!(out.contains("LUKS2"));
         assert!(out.contains("TPM2 auto-unlock"));
         assert!(out.contains("spun-down"));
-        assert!(out.contains("standby 5min · off 30min"));
+        assert!(out.contains("standby 10min"));
         assert!(out.contains("summary"));
         assert!(
             !out.contains('\x1b'),

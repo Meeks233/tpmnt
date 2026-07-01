@@ -124,6 +124,9 @@ fn render_human(command: &Command, value: &Value) {
                     println!("  warning: {w}");
                 }
             }
+            if let Some(w) = value.get("warning").and_then(|v| v.as_str()) {
+                println!("  warning: {w}");
+            }
         }
     }
 }

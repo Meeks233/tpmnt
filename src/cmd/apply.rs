@@ -98,7 +98,6 @@ pub fn run(ctx: &Context) -> Result<Value> {
             "token": token_action,
             "power_profile": disk.power_profile,
             "standby_timeout_secs": disk.standby_timeout_secs(&ctx.config.defaults),
-            "poweroff_timeout_secs": disk.poweroff_timeout_secs(&ctx.config.defaults),
             "monitor_unit": monitor_change,
             "schedule_unit": schedule_change,
             "changes": changes,

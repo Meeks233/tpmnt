@@ -1,7 +1,12 @@
 //! Per-disk power management for the `cold-standby` profile: detect *real* block
 //! I/O on the decrypted mapper, and when a disk has been idle past its window,
-//! spin the whole backing disk down (unmount -> cryptsetup close -> power off)
-//! to stop needless platter wear. `always-on` disks are never touched.
+//! spin the platters down to *standby* (mapping kept open; transparent wake on
+//! next access) to stop needless platter wear. The disk then rests at standby —
+//! tpmnt never auto-powers-off, because standby already captures ~all the
+//! HDD-lifespan benefit a full power-off would (a wake costs the same start/stop
+//! cycle either way) without the physical-reload cost. Full power-off / OS
+//! removal is a manual, explicit action (`tpmnt power … --method`). `always-on`
+//! disks are never touched.
 //!
 //! Idleness is judged from `/sys/block/<dm>/stat` counters, NOT atime — atime
 //! updates would otherwise masquerade as access. Cold-standby disks are also
@@ -28,9 +33,9 @@ struct MonitorState {
     counter: u64,
     /// Epoch seconds when `counter` last changed (i.e. last real access).
     last_change: u64,
-    /// True once the platters have been parked at the standby stage (mapping still
-    /// open). Cleared on the next real access. Prevents re-issuing `hdparm -y`
-    /// every tick while idle between the standby and power-off windows.
+    /// True once the platters have been parked at standby (mapping still open).
+    /// Cleared on the next real access. Prevents re-issuing `hdparm -y` every tick
+    /// while the disk rests at standby.
     #[serde(default)]
     standby: bool,
 }
@@ -722,6 +727,7 @@ fn spindown_impl(
         return Ok(SpinOutcome::Down(json!({
             "ok": true, "action": "power-off", "name": disk.name,
             "method_used": method_used, "skip_reason": null,
+            "warning": wake_warning(method_used),
             "dry_run": dry, "steps": steps,
         })));
     }
@@ -790,6 +796,7 @@ fn spindown_impl(
         "name": disk.name,
         "method_used": method_used,
         "skip_reason": skip_reason,
+        "warning": wake_warning(method_used),
         "dry_run": dry,
         "steps": steps,
     })))
@@ -927,6 +934,23 @@ fn power_err(e: Error) -> Error {
         .with_hint("install hdparm/udisksctl, or set power_off_method explicitly")
 }
 
+/// A caveat surfaced on the spin-down result when the chosen method leaves the
+/// disk in a state that `tpmnt power <name> --on` cannot revive by itself —
+/// `power-off` cuts enclosure power (LED off) and `sleep` needs a bus reset, so
+/// both require a physical reconnect/power-cycle before the disk can wake. The
+/// default `standby`/`auto` methods keep the disk softwake-able and warn nothing.
+fn wake_warning(method_used: &str) -> Option<&'static str> {
+    match method_used {
+        "power-off" => Some(
+            "fully powered off: the enclosure left the bus (LED off) — waking needs a physical reconnect/power-cycle; `tpmnt power <name> --on` alone cannot revive it",
+        ),
+        "sleep" => Some(
+            "put to SLEEP (hdparm -Y): needs a bus reset / physical reconnect to wake",
+        ),
+        _ => None,
+    }
+}
+
 fn load_state(path: &Path) -> Option<MonitorState> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
@@ -941,7 +965,13 @@ fn save_state(path: &Path, state: &MonitorState) {
 }
 
 /// What a monitor tick should do, decided purely from the idle timing so the
-/// two-stage state machine can be unit-tested without a live mapper/sysfs.
+/// state machine can be unit-tested without a live mapper/sysfs.
+///
+/// Cold-standby rests an idle disk at *standby* and stops there — it never
+/// auto-powers-off. Standby already captures ~all the HDD-lifespan benefit a full
+/// power-off would (a wake costs the same one start/stop cycle either way), while
+/// a real power-off risks needing a physical reload to wake. So there is no
+/// power-off stage here; full power-off is a manual, explicit action.
 #[derive(Debug, PartialEq, Eq)]
 enum IdleAction {
     /// Real access (or first observation): keep the disk up, reset the idle clock.
@@ -951,27 +981,20 @@ enum IdleAction {
     /// Crossed the standby window and not yet parked: spin the platters down now
     /// (mapping stays open for a transparent wake).
     EnterStandby,
-    /// Already parked, idle between the standby and power-off windows: keep waiting.
+    /// Already parked and idle: keep resting at standby (the terminal state).
     HoldStandby,
-    /// Crossed the power-off window: full teardown (unmount + close + power off).
-    PowerOff,
 }
 
-/// Two-stage cold-standby idle decision. Precedence is **activity > power-off >
-/// standby**, so real I/O always resets the clock, and an inverted config
-/// (`poweroff_to <= standby_to`) still powers off rather than parking forever.
+/// Single-stage cold-standby idle decision. Precedence is **activity > standby**,
+/// so real I/O always resets the clock; once parked the disk simply rests.
 fn decide_idle(
     activity: bool,
     idle_secs: u64,
     standby_to: u64,
-    poweroff_to: u64,
     already_standby: bool,
 ) -> IdleAction {
     if activity {
         return IdleAction::Active;
-    }
-    if idle_secs >= poweroff_to {
-        return IdleAction::PowerOff;
     }
     if idle_secs >= standby_to {
         return if already_standby {
@@ -983,8 +1006,9 @@ fn decide_idle(
     IdleAction::Wait
 }
 
-/// One monitor tick: observe real I/O, update idle state, and spin the disk down
-/// if it has been idle past its window. Idempotent and safe to call on a repeat.
+/// One monitor tick: observe real I/O, update idle state, and spin the platters
+/// down to standby if the disk has been idle past its window (then rest there).
+/// Idempotent and safe to call on a repeat.
 pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
     if !disk.is_cold_standby() {
         return Ok(json!({
@@ -1003,7 +1027,6 @@ pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
     }
 
     let standby_to = disk.standby_timeout_secs(&ctx.config.defaults);
-    let poweroff_to = disk.poweroff_timeout_secs(&ctx.config.defaults);
     let counter = mapper_stat_path(&mapper).and_then(|p| read_io_counter(&p));
     let counter = match counter {
         Some(c) => c,
@@ -1027,7 +1050,7 @@ pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
     let already = prev.as_ref().map(|s| s.standby).unwrap_or(false);
     let dry = ctx.global.effective_dry_run();
 
-    match decide_idle(activity, idle_secs, standby_to, poweroff_to, already) {
+    match decide_idle(activity, idle_secs, standby_to, already) {
         IdleAction::Active => {
             if !dry {
                 // Real access wakes any parked platters: clear the standby flag.
@@ -1046,30 +1069,19 @@ pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
             Ok(json!({
                 "ok": true, "action": "keep", "name": disk.name,
                 "io_counter": counter, "idle_secs": 0,
-                "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
+                "standby_timeout_secs": standby_to,
                 "reason": "real access detected", "tune": tune,
             }))
         }
 
-        // Stage 2: fully idle past the power-off window -> unmount + close + power off.
-        IdleAction::PowerOff => {
-            let sd = spindown(ctx, disk, None)?; // resets/removes monitor state on success
-            Ok(json!({
-                "ok": true, "action": "power-off", "name": disk.name,
-                "io_counter": counter, "idle_secs": idle_secs,
-                "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
-                "spindown": sd,
-            }))
-        }
-
-        // Stage 1: idle past the standby window -> park the platters, keep the
-        // mapping open (transparent wake on next access). Issued once per stretch.
+        // Idle past the standby window -> park the platters, keep the mapping open
+        // (transparent wake on next access). Issued once per idle stretch. This is
+        // the terminal resting state: tpmnt never auto-escalates to a power-off.
         IdleAction::EnterStandby => {
             let standby = enter_standby(ctx, disk);
             if !dry {
-                // Preserve counter/last_change (idle keeps counting toward
-                // power-off); just mark the platters parked. prev is Some whenever
-                // activity is false, so this always persists.
+                // Preserve counter/last_change; just mark the platters parked. prev
+                // is Some whenever activity is false, so this always persists.
                 if let Some(mut s) = prev {
                     s.standby = true;
                     save_state(&state_path, &s);
@@ -1078,7 +1090,7 @@ pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
             Ok(json!({
                 "ok": true, "action": "standby", "name": disk.name,
                 "io_counter": counter, "idle_secs": idle_secs,
-                "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
+                "standby_timeout_secs": standby_to,
                 "standby": standby,
             }))
         }
@@ -1086,14 +1098,14 @@ pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
         IdleAction::HoldStandby => Ok(json!({
             "ok": true, "action": "keep", "name": disk.name,
             "io_counter": counter, "idle_secs": idle_secs,
-            "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
-            "reason": "in standby; awaiting power-off window",
+            "standby_timeout_secs": standby_to,
+            "reason": "resting at standby (no auto power-off)",
         })),
 
         IdleAction::Wait => Ok(json!({
             "ok": true, "action": "keep", "name": disk.name,
             "io_counter": counter, "idle_secs": idle_secs,
-            "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
+            "standby_timeout_secs": standby_to,
             "reason": "idle but within standby window",
         })),
     }
@@ -1385,74 +1397,67 @@ mod tests {
         assert_eq!(physical_device_for("/dev/loop0"), "/dev/loop0");
     }
 
-    // --- Two-stage cold-standby idle state machine (5min standby / 30min off) ---
+    // --- Single-stage cold-standby idle state machine (rest at standby, no ----
+    // --- auto power-off; full power-off is a manual, explicit action) ----------
 
     const STANDBY: u64 = 300; // 5 min
-    const OFF: u64 = 1800; // 30 min
 
     #[test]
-    fn idle_walkthrough_default_5min_30min() {
+    fn idle_walkthrough_rests_at_standby() {
         use IdleAction::*;
         // Real access always resets, whatever the idle number says.
-        assert_eq!(decide_idle(true, 99_999, STANDBY, OFF, false), Active);
-        assert_eq!(decide_idle(true, 0, STANDBY, OFF, true), Active);
+        assert_eq!(decide_idle(true, 99_999, STANDBY, false), Active);
+        assert_eq!(decide_idle(true, 0, STANDBY, true), Active);
 
         // Idle but inside the standby window (0 <= idle < 5min): leave it alone.
-        assert_eq!(decide_idle(false, 0, STANDBY, OFF, false), Wait);
-        assert_eq!(decide_idle(false, 299, STANDBY, OFF, false), Wait);
+        assert_eq!(decide_idle(false, 0, STANDBY, false), Wait);
+        assert_eq!(decide_idle(false, 299, STANDBY, false), Wait);
 
         // Exactly at the standby threshold, not yet parked: park now.
-        assert_eq!(decide_idle(false, 300, STANDBY, OFF, false), EnterStandby);
-        assert_eq!(decide_idle(false, 900, STANDBY, OFF, false), EnterStandby);
+        assert_eq!(decide_idle(false, 300, STANDBY, false), EnterStandby);
+        assert_eq!(decide_idle(false, 900, STANDBY, false), EnterStandby);
 
-        // Already parked, between standby and power-off windows: keep waiting.
-        assert_eq!(decide_idle(false, 300, STANDBY, OFF, true), HoldStandby);
-        assert_eq!(decide_idle(false, 1799, STANDBY, OFF, true), HoldStandby);
-
-        // At/over the power-off threshold: full teardown, regardless of parked flag.
-        assert_eq!(decide_idle(false, 1800, STANDBY, OFF, false), PowerOff);
-        assert_eq!(decide_idle(false, 1800, STANDBY, OFF, true), PowerOff);
-        assert_eq!(decide_idle(false, 9_999, STANDBY, OFF, true), PowerOff);
+        // Already parked: rest at standby indefinitely — never escalates further,
+        // no matter how long it stays idle.
+        assert_eq!(decide_idle(false, 300, STANDBY, true), HoldStandby);
+        assert_eq!(decide_idle(false, 1_800, STANDBY, true), HoldStandby);
+        assert_eq!(decide_idle(false, 999_999, STANDBY, true), HoldStandby);
     }
 
     #[test]
-    fn power_off_wins_over_standby_at_boundary() {
-        // The instant idle reaches the power-off window it must power off, even if
-        // it hasn't been parked yet (e.g. a coarse poll jumped past both windows).
-        assert_eq!(
-            decide_idle(false, 1800, STANDBY, OFF, false),
-            IdleAction::PowerOff
-        );
-    }
-
-    #[test]
-    fn inverted_config_never_parks_forever() {
-        // Misconfig where power-off <= standby: power-off precedence means the disk
-        // still goes down instead of parking indefinitely and never powering off.
-        assert_eq!(decide_idle(false, 60, 300, 60, false), IdleAction::PowerOff);
-        assert_eq!(decide_idle(false, 60, 300, 60, true), IdleAction::PowerOff);
-        // Below the (lower) power-off threshold it just waits.
-        assert_eq!(decide_idle(false, 30, 300, 60, false), IdleAction::Wait);
+    fn no_action_ever_powers_off() {
+        use IdleAction::*;
+        // Exhaustively: whatever the timing, the monitor only ever keeps or parks —
+        // it must never auto-power-off (that would need a physical reload to wake).
+        for &act in &[true, false] {
+            for &idle in &[0u64, 1, 300, 1_800, 86_400, u64::MAX] {
+                for &parked in &[true, false] {
+                    let a = decide_idle(act, idle, STANDBY, parked);
+                    assert!(
+                        matches!(a, Active | Wait | EnterStandby | HoldStandby),
+                        "act={act} idle={idle} parked={parked} -> {a:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
     fn full_lifecycle_transitions_in_order() {
         use IdleAction::*;
-        // Simulate the exact sequence the monitor walks a disk through with the
-        // 1min/2min test tuning validated on the real remote disk.
-        let (s, o) = (60u64, 120u64);
-        // t<60 idle -> wait; ==60 -> enter standby; parked & <120 -> hold; >=120 -> off.
+        // The sequence the monitor walks a disk through: wait -> park -> rest.
+        let s = 60u64;
         let seq = [
             (false, 0, false, Wait),
             (false, 59, false, Wait),
             (false, 61, false, EnterStandby),
             (false, 74, true, HoldStandby),
-            (false, 110, true, HoldStandby),
-            (false, 122, true, PowerOff),
+            (false, 100_000, true, HoldStandby), // still just resting, never off
+            (true, 0, true, Active),             // access wakes + resets
         ];
         for (act, idle, parked, want) in seq {
             assert_eq!(
-                decide_idle(act, idle, s, o, parked),
+                decide_idle(act, idle, s, parked),
                 want,
                 "idle={idle} parked={parked}"
             );

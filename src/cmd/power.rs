@@ -33,14 +33,13 @@ fn find_disk<'a>(ctx: &'a Context, name: &str) -> Result<&'a crate::config::Disk
 ///   * otherwise (or `--off`) it spins the named disk down, honoring a one-shot
 ///     `--method` override of the configured power_off_method.
 pub fn run(ctx: &Context, args: &PowerArgs) -> Result<Value> {
-    if args.standby_timeout.is_some() || args.poweroff_timeout.is_some() {
+    if args.standby_timeout.is_some() {
         return set_timeouts(ctx, args);
     }
 
     let name = args.name.as_deref().ok_or_else(|| {
-        crate::error::Error::new(Code::EConfig, "power needs a disk name".to_string()).with_hint(
-            "pass a [[disk]] name to power on/off, or --standby-timeout/--poweroff-timeout to configure",
-        )
+        crate::error::Error::new(Code::EConfig, "power needs a disk name".to_string())
+            .with_hint("pass a [[disk]] name to power on/off, or --standby-timeout to configure")
     })?;
     let disk = find_disk(ctx, name)?;
 
@@ -58,21 +57,17 @@ pub fn run(ctx: &Context, args: &PowerArgs) -> Result<Value> {
     power::spindown(ctx, disk, method)
 }
 
-/// Set the cold-standby standby/power-off idle windows and persist the config.
-/// With --global (or no disk name) the values land in `[defaults]`; otherwise
-/// they override just the named disk. Per-disk values take precedence at runtime.
+/// Set the cold-standby standby idle window and persist the config. With --global
+/// (or no disk name) the value lands in `[defaults]`; otherwise it overrides just
+/// the named disk. Per-disk values take precedence at runtime.
 fn set_timeouts(ctx: &Context, args: &PowerArgs) -> Result<Value> {
-    // Validate durations up front so a typo never writes a bad config.
-    for v in [&args.standby_timeout, &args.poweroff_timeout]
-        .into_iter()
-        .flatten()
-    {
-        if crate::config::parse_duration(v).is_none() {
-            return err(
-                Code::EConfig,
-                format!("invalid duration '{v}' (use e.g. \"5min\", \"30s\", \"1h\")"),
-            );
-        }
+    // Validate the duration up front so a typo never writes a bad config.
+    let standby = args.standby_timeout.as_deref().unwrap();
+    if crate::config::parse_duration(standby).is_none() {
+        return err(
+            Code::EConfig,
+            format!("invalid duration '{standby}' (use e.g. \"5min\", \"30s\", \"1h\")"),
+        );
     }
 
     let path = &ctx.global.config;
@@ -81,12 +76,7 @@ fn set_timeouts(ctx: &Context, args: &PowerArgs) -> Result<Value> {
     let global = args.global || args.name.is_none();
 
     let scope = if global {
-        if let Some(s) = &args.standby_timeout {
-            cfg.defaults.standby_timeout = s.clone();
-        }
-        if let Some(p) = &args.poweroff_timeout {
-            cfg.defaults.poweroff_timeout = p.clone();
-        }
+        cfg.defaults.standby_timeout = standby.to_string();
         json!({"scope": "global"})
     } else {
         let name = args.name.as_deref().unwrap();
@@ -98,12 +88,7 @@ fn set_timeouts(ctx: &Context, args: &PowerArgs) -> Result<Value> {
                 crate::error::Error::new(Code::EConfig, format!("no [[disk]] named '{name}'"))
                     .with_hint("check `tpmnt status` for configured disk names")
             })?;
-        if args.standby_timeout.is_some() {
-            disk.standby_timeout = args.standby_timeout.clone();
-        }
-        if args.poweroff_timeout.is_some() {
-            disk.poweroff_timeout = args.poweroff_timeout.clone();
-        }
+        disk.standby_timeout = Some(standby.to_string());
         json!({"scope": "disk", "name": name})
     };
 
@@ -112,10 +97,9 @@ fn set_timeouts(ctx: &Context, args: &PowerArgs) -> Result<Value> {
     }
     Ok(json!({
         "ok": true,
-        "action": "set-power-timeouts",
+        "action": "set-standby-timeout",
         "scope": scope,
-        "standby_timeout": args.standby_timeout,
-        "poweroff_timeout": args.poweroff_timeout,
+        "standby_timeout": standby,
         "config": path.display().to_string(),
         "dry_run": dry,
     }))
@@ -188,8 +172,8 @@ pub fn monitor(ctx: &Context, args: &MonitorArgs) -> Result<Value> {
     }
 
     // Loop forever (the systemd unit owns the lifecycle). Poll at a fraction of
-    // the (shorter) standby window, clamped to a sane [5s, 60s] range so both the
-    // standby and power-off thresholds are caught promptly.
+    // the standby window, clamped to a sane [5s, 60s] range so the standby
+    // threshold is caught promptly.
     let poll = (disk.standby_timeout_secs(&ctx.config.defaults) / 5).clamp(5, 60);
     loop {
         let tick = power::monitor_tick(ctx, disk)?;

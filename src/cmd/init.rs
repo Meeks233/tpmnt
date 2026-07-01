@@ -45,7 +45,6 @@ struct InitSpec {
     power_profile: Option<String>,
     #[serde(alias = "idle_timeout")]
     standby_timeout: Option<String>,
-    poweroff_timeout: Option<String>,
     power_off_method: Option<String>,
     remote: Option<String>,
 }
@@ -81,7 +80,6 @@ struct Resolved {
     no_register: bool,
     power_profile: crate::config::PowerProfile,
     standby_timeout: Option<String>,
-    poweroff_timeout: Option<String>,
     power_off_method: crate::config::PowerOffMethod,
 }
 
@@ -331,7 +329,6 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
             with_pin: r.with_pin,
             power_profile: r.power_profile,
             standby_timeout: r.standby_timeout.clone(),
-            poweroff_timeout: r.poweroff_timeout.clone(),
             power_off_method: r.power_off_method,
             teardown: crate::config::Teardown::Direct,
             schedule: None,
@@ -504,7 +501,6 @@ fn resolve(args: &InitArgs) -> Result<Resolved> {
             }
         },
         standby_timeout: args.standby_timeout.clone().or(spec.standby_timeout),
-        poweroff_timeout: args.poweroff_timeout.clone().or(spec.poweroff_timeout),
         power_off_method: {
             let raw = args.power_off_method.clone().or(spec.power_off_method);
             match raw {

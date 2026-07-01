@@ -203,13 +203,10 @@ pub struct InitArgs {
     pub power_profile: Option<String>,
     /// Idle window before a cold-standby disk's platters spin down to standby
     /// (mapping kept open; wakes on next access). Default "5min". The old
-    /// `--idle-timeout` name is accepted as an alias.
+    /// `--idle-timeout` name is accepted as an alias. tpmnt never auto-powers-off
+    /// past standby — full power-off is a manual `tpmnt power … --method` action.
     #[arg(long, alias = "idle-timeout")]
     pub standby_timeout: Option<String>,
-    /// Idle window before a cold-standby disk is fully powered off (unmount +
-    /// close + power down). Default "30min"; must exceed --standby-timeout.
-    #[arg(long)]
-    pub poweroff_timeout: Option<String>,
     /// Power-down method: "auto" (default), "standby", "sleep", "power-off", or
     /// "remove" (remove the disk from its host OS; reversible on next spin-up).
     #[arg(long)]
@@ -441,12 +438,7 @@ pub struct PowerArgs {
     /// the named disk, or to the global [defaults] with --global.
     #[arg(long)]
     pub standby_timeout: Option<String>,
-    /// Set the cold-standby power-off window (idle time before full teardown +
-    /// power off). Writes config instead of spinning down now.
-    #[arg(long)]
-    pub poweroff_timeout: Option<String>,
-    /// Apply --standby-timeout/--poweroff-timeout to the global [defaults] rather
-    /// than a single disk.
+    /// Apply --standby-timeout to the global [defaults] rather than a single disk.
     #[arg(long)]
     pub global: bool,
 }

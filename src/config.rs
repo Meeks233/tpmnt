@@ -43,14 +43,13 @@ pub struct Defaults {
     pub key_backup: PathBuf,
     /// Global cold-standby idle window before the platters are spun down to
     /// standby (mapping kept open, wakes on next access). A per-disk
-    /// `standby_timeout` overrides this.
+    /// `standby_timeout` overrides this. There is deliberately no auto power-off
+    /// stage: research shows standby already captures ~all the HDD-lifespan
+    /// benefit a full power-off would (both cost the same start/stop cycle on
+    /// wake), so tpmnt rests idle disks at standby and never auto-powers-off.
+    /// Full power-off is a manual, explicit action (`tpmnt power … --method`).
     #[serde(default = "default_standby_timeout")]
     pub standby_timeout: String,
-    /// Global cold-standby idle window before the disk is fully powered off
-    /// (unmount + close + power down the backing device). Must be longer than
-    /// `standby_timeout`. A per-disk `poweroff_timeout` overrides this.
-    #[serde(default = "default_poweroff_timeout")]
-    pub poweroff_timeout: String,
 }
 
 impl Default for Defaults {
@@ -64,7 +63,6 @@ impl Default for Defaults {
             with_pin: false,
             key_backup: default_key_backup(),
             standby_timeout: default_standby_timeout(),
-            poweroff_timeout: default_poweroff_timeout(),
         }
     }
 }
@@ -98,8 +96,8 @@ pub struct Disk {
     #[serde(default)]
     pub with_pin: bool,
     /// Usage scenario. `cold-standby` (default) disks are spun down to standby
-    /// after `standby_timeout` and fully powered off after `poweroff_timeout` with
-    /// no real access; `always-on` is never touched.
+    /// after `standby_timeout` with no real access and then rest there (tpmnt
+    /// never auto-powers-off); `always-on` is never touched.
     #[serde(default)]
     pub power_profile: PowerProfile,
     /// Per-disk override for the idle window before the platters are spun down to
@@ -108,11 +106,6 @@ pub struct Disk {
     /// disks. The legacy `idle_timeout` key is accepted as an alias.
     #[serde(default, alias = "idle_timeout")]
     pub standby_timeout: Option<String>,
-    /// Per-disk override for the idle window before the disk is fully powered off
-    /// (unmount + close + power down). Unset = the global
-    /// `[defaults].poweroff_timeout`. Same duration format as `standby_timeout`.
-    #[serde(default)]
-    pub poweroff_timeout: Option<String>,
     /// How to power the backing disk down (see `PowerOffMethod`).
     #[serde(default)]
     pub power_off_method: PowerOffMethod,
@@ -459,16 +452,6 @@ impl Disk {
             .or_else(|| parse_duration(&defaults.standby_timeout))
             .unwrap_or(300)
     }
-
-    /// Idle window (seconds) before the disk is fully powered off: the per-disk
-    /// override if set, else the global default, else 1800s (30min).
-    pub fn poweroff_timeout_secs(&self, defaults: &Defaults) -> u64 {
-        self.poweroff_timeout
-            .as_deref()
-            .and_then(parse_duration)
-            .or_else(|| parse_duration(&defaults.poweroff_timeout))
-            .unwrap_or(1800)
-    }
 }
 
 /// Parse a human duration ("5min", "30s", "10m", "1h", "300") into seconds.
@@ -526,9 +509,6 @@ fn default_key_backup() -> PathBuf {
 }
 fn default_standby_timeout() -> String {
     "5min".to_string()
-}
-fn default_poweroff_timeout() -> String {
-    "30min".to_string()
 }
 fn default_true() -> bool {
     true
@@ -628,9 +608,8 @@ mountpoint = "/mnt/d"
         assert_eq!(d.power_profile, PowerProfile::ColdStandby);
         assert!(d.is_cold_standby());
         let defs = Defaults::default();
-        // Undeclared timeouts fall back to the global defaults: 5min / 30min.
+        // An undeclared standby window falls back to the global default: 5min.
         assert_eq!(d.standby_timeout_secs(&defs), 300);
-        assert_eq!(d.poweroff_timeout_secs(&defs), 1800);
         assert_eq!(d.power_off_method, PowerOffMethod::Auto);
     }
 
@@ -705,7 +684,6 @@ uuid = "u"
 mountpoint = "/mnt/cold"
 power_profile = "cold-standby"
 standby_timeout = "10m"
-poweroff_timeout = "2h"
 power_off_method = "power-off"
 "#,
         )
@@ -714,19 +692,17 @@ power_off_method = "power-off"
         let defs = Defaults::default();
         assert!(d.is_cold_standby());
         assert_eq!(d.standby_timeout_secs(&defs), 600);
-        assert_eq!(d.poweroff_timeout_secs(&defs), 7200);
         assert_eq!(d.power_off_method, PowerOffMethod::PowerOff);
     }
 
     #[test]
-    fn timeout_override_and_legacy_alias() {
-        // Global defaults raised; one disk overrides only standby, the other uses
-        // the legacy `idle_timeout` key (alias for standby_timeout).
+    fn standby_override_and_legacy_alias() {
+        // Global default raised; one disk overrides standby, the other uses the
+        // legacy `idle_timeout` key (alias for standby_timeout).
         let cfg: Config = toml::from_str(
             r#"
 [defaults]
 standby_timeout = "2min"
-poweroff_timeout = "1h"
 
 [[disk]]
 name = "a"
@@ -739,16 +715,21 @@ name = "b"
 uuid = "u2"
 mountpoint = "/mnt/b"
 idle_timeout = "45s"
+
+[[disk]]
+name = "c"
+uuid = "u3"
+mountpoint = "/mnt/c"
 "#,
         )
         .unwrap();
         let defs = &cfg.defaults;
-        // Disk a: per-disk standby overrides global; poweroff falls back to global.
+        // Disk a: per-disk standby overrides the global default.
         assert_eq!(cfg.disks[0].standby_timeout_secs(defs), 90);
-        assert_eq!(cfg.disks[0].poweroff_timeout_secs(defs), 3600);
         // Disk b: legacy idle_timeout populates standby via serde alias.
         assert_eq!(cfg.disks[1].standby_timeout_secs(defs), 45);
-        assert_eq!(cfg.disks[1].poweroff_timeout_secs(defs), 3600);
+        // Disk c: no override -> the global default (2min).
+        assert_eq!(cfg.disks[2].standby_timeout_secs(defs), 120);
     }
 
     #[test]

@@ -469,7 +469,6 @@ fn register_new_disk(
         with_pin: args.with_pin,
         power_profile: crate::config::PowerProfile::default(),
         standby_timeout: None,
-        poweroff_timeout: None,
         power_off_method: crate::config::PowerOffMethod::default(),
         teardown: crate::config::Teardown::Direct,
         schedule: None,

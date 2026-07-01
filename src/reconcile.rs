@@ -306,7 +306,6 @@ mod tests {
             with_pin: false,
             power_profile: crate::config::PowerProfile::AlwaysOn,
             standby_timeout: None,
-            poweroff_timeout: None,
             power_off_method: crate::config::PowerOffMethod::Auto,
             teardown: crate::config::Teardown::Direct,
             schedule: None,
