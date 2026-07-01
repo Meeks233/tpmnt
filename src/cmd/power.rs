@@ -26,20 +26,36 @@ fn find_disk<'a>(ctx: &'a Context, name: &str) -> Result<&'a crate::config::Disk
         })
 }
 
-/// `tpmnt power`: with a timeout flag it *configures* the cold-standby windows
-/// (global or per-disk) and writes the config; otherwise it spins the named disk
-/// down now (unmount + close + power off the backing disk).
+/// `tpmnt power`: one verb for the whole power lifecycle, so callers never touch
+/// the underlying cryptsetup/mount/hdparm/udisks/nbd steps:
+///   * a timeout flag *configures* the cold-standby windows (global or per-disk);
+///   * `--on` brings the disk back up (rescan + rebuild forward + open + mount);
+///   * otherwise (or `--off`) it spins the named disk down, honoring a one-shot
+///     `--method` override of the configured power_off_method.
 pub fn run(ctx: &Context, args: &PowerArgs) -> Result<Value> {
     if args.standby_timeout.is_some() || args.poweroff_timeout.is_some() {
         return set_timeouts(ctx, args);
     }
+
     let name = args.name.as_deref().ok_or_else(|| {
         crate::error::Error::new(Code::EConfig, "power needs a disk name".to_string()).with_hint(
-            "pass a [[disk]] name to spin down, or --standby-timeout/--poweroff-timeout to configure",
+            "pass a [[disk]] name to power on/off, or --standby-timeout/--poweroff-timeout to configure",
         )
     })?;
     let disk = find_disk(ctx, name)?;
-    power::spindown(ctx, disk)
+
+    if args.on {
+        return power::spinup(ctx, disk);
+    }
+
+    let method = match args.method.as_deref() {
+        Some(s) => Some(crate::config::PowerOffMethod::parse(s).ok_or_else(|| {
+            crate::error::Error::new(Code::EConfig, format!("invalid --method '{s}'"))
+                .with_hint("use 'auto', 'standby', 'sleep', 'power-off', or 'remove'")
+        })?),
+        None => None,
+    };
+    power::spindown(ctx, disk, method)
 }
 
 /// Set the cold-standby standby/power-off idle windows and persist the config.

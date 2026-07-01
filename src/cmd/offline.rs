@@ -40,7 +40,7 @@ pub fn run(ctx: &Context, args: &OfflineArgs) -> Result<Value> {
         "forced": args.force,
         "dry_run": dry,
         "steps": steps,
-        "note": "data untouched; config kept — recover with `tpmnt recover --open`, a reboot, or spinup",
+        "note": "data untouched; config kept — bring it back with `tpmnt power <name> --on` (or `tpmnt recover --open`, or a reboot)",
     }))
 }
 

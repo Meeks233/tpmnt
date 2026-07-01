@@ -387,12 +387,37 @@ fn sysfs_write(ctx: &Context, prefix: &[String], path: &str, val: &str, why: &st
     Ok(())
 }
 
-/// The `remove` power-off tail: after the mapping is torn down, remove the
-/// backing block device from its host OS so the disk fully disappears (a disk
-/// manager's "Power Off Disk"), recording how to bring it back. For a remote
-/// disk the ciphertext forward is discovered and torn down first, since the
-/// device can't be deleted while `qemu-nbd` holds it open.
-fn remove_from_os(ctx: &Context, disk: &Disk) -> Result<Value> {
+/// How the backing device is made to "disappear" from its host OS in the
+/// forward-aware detach path. Both are reversed identically on spin-up (SCSI host
+/// rescan), differing only in whether the drive's power is actually cut.
+#[derive(Clone, Copy, PartialEq)]
+enum Disappear {
+    /// `echo 1 > /sys/block/<dev>/device/delete`: drop the device from the OS.
+    /// Spins the platters down (STOP UNIT) but does NOT cut bus/enclosure power —
+    /// a USB/dock's LED stays lit.
+    Delete,
+    /// `udisksctl power-off -b <dev>`: truly power the drive down (and, for
+    /// USB/dock enclosures, drop bus power so the LED goes out). Reversible via
+    /// the same SCSI rescan.
+    PowerOff,
+}
+
+impl Disappear {
+    fn label(self) -> &'static str {
+        match self {
+            Disappear::Delete => "remove",
+            Disappear::PowerOff => "power-off",
+        }
+    }
+}
+
+/// The forward-aware detach tail shared by the `remove` and (remote) `power-off`
+/// methods: after the mapping is torn down, make the backing block device
+/// disappear from its host OS — either dropped (`Delete`) or truly powered off
+/// (`PowerOff`) — recording how to bring it back. For a remote disk the
+/// ciphertext forward is discovered and torn down first, since the device can't
+/// be deleted/powered-off while `qemu-nbd` holds it open.
+fn detach_from_os(ctx: &Context, disk: &Disk, action: Disappear) -> Result<Value> {
     let (phys, prefix) = phys_and_prefix(ctx, disk);
     let base = phys.rsplit('/').next().unwrap_or(&phys).to_string();
     let remote = !prefix.is_empty();
@@ -404,10 +429,10 @@ fn remove_from_os(ctx: &Context, disk: &Disk) -> Result<Value> {
                 "cannot resolve SCSI host for {phys}; refusing to remove (would be unrecoverable)"
             ),
         )
-        .with_hint("the disk must sit on a rescannable SCSI/USB host for `remove` power-off")
+        .with_hint("the disk must sit on a rescannable SCSI/USB host to detach + recover it")
     })?;
 
-    // For a remote disk, discover + tear the forward down so the delete succeeds.
+    // For a remote disk, discover + tear the forward down so the detach succeeds.
     let mut port = 0u16;
     if remote {
         let local_dev = local_container(ctx, disk)?;
@@ -445,25 +470,41 @@ fn remove_from_os(ctx: &Context, disk: &Disk) -> Result<Value> {
     }
     let _ = std::fs::write(&sp, serde_json::to_string(&state).unwrap_or_default());
 
-    // Remove the block device from its host OS (spins it down via STOP UNIT too).
-    sysfs_write(
-        ctx,
-        &prefix,
-        &format!("/sys/block/{base}/device/delete"),
-        "1",
-        "remove backing disk from host OS (device/delete)",
-    )?;
+    // Make the device disappear from its host OS.
+    match action {
+        Disappear::Delete => {
+            // Drop the device (spins it down via STOP UNIT, but keeps bus power).
+            sysfs_write(
+                ctx,
+                &prefix,
+                &format!("/sys/block/{base}/device/delete"),
+                "1",
+                "remove backing disk from host OS (device/delete)",
+            )?;
+        }
+        Disappear::PowerOff => {
+            // Truly power the drive/enclosure down (LED off), via udisks.
+            ctx.runner
+                .run_on(
+                    &prefix,
+                    &priv_argv(&prefix, &["udisksctl", "power-off", "-b", &phys]),
+                    "power off backing disk (udisksctl power-off)",
+                )?
+                .require("udisksctl power-off")
+                .map_err(power_err)?;
+        }
+    }
 
     Ok(json!({
         "step": "power-down",
         "device": phys,
-        "method_used": "remove",
+        "method_used": action.label(),
         "scsi_host": scsi_host,
-        "removed_from_os": true,
+        "detached_from_os": true,
     }))
 }
 
-/// Reverse `remove_from_os`: rescan the SCSI host to re-probe the disk, wait for
+/// Reverse `detach_from_os`: rescan the SCSI host to re-probe the disk, wait for
 /// it to reappear, and (for a remote disk) rebuild the ciphertext forward so the
 /// caller can `cryptsetup open` it again. No-op when no removal is recorded.
 fn restore_from_os(ctx: &Context, disk: &Disk) -> Result<Option<Value>> {
@@ -535,8 +576,12 @@ fn restore_from_os(ctx: &Context, disk: &Disk) -> Result<Option<Value>> {
 /// Spin the whole disk down: unmount -> close mapping -> power off the platters.
 /// Errors if the disk is busy (a clean unmount is impossible) rather than
 /// forcing it — `tpmnt schedule` uses the soft path that defers instead.
-pub fn spindown(ctx: &Context, disk: &Disk) -> Result<Value> {
-    match spindown_impl(ctx, disk, false)? {
+pub fn spindown(
+    ctx: &Context,
+    disk: &Disk,
+    method_override: Option<PowerOffMethod>,
+) -> Result<Value> {
+    match spindown_impl(ctx, disk, false, method_override)? {
         SpinOutcome::Down(v) => Ok(v),
         SpinOutcome::Busy(_) => Err(Error::new(
             Code::EPowerOff,
@@ -550,7 +595,12 @@ pub fn spindown(ctx: &Context, disk: &Disk) -> Result<Value> {
 /// decides whether to wait/defer) instead of failing — so data transfer in
 /// flight is never interrupted. Every mutating step goes through the Runner so
 /// --dry-run/--plan/--debug work.
-fn spindown_impl(ctx: &Context, disk: &Disk, soft: bool) -> Result<SpinOutcome> {
+fn spindown_impl(
+    ctx: &Context,
+    disk: &Disk,
+    soft: bool,
+    method_override: Option<PowerOffMethod>,
+) -> Result<SpinOutcome> {
     let dry = ctx.global.effective_dry_run();
     let mapper = disk.mapper_name();
     let mapper_dev = format!("/dev/mapper/{mapper}");
@@ -619,28 +669,40 @@ fn spindown_impl(ctx: &Context, disk: &Disk, soft: bool) -> Result<SpinOutcome> 
     }
 
     // 3. power down the backing physical disk (on its host — local or remote).
+    //    A one-shot --method wins over the disk's configured power_off_method.
     let (phys, prefix) = phys_and_prefix(ctx, disk);
-    let resolved = resolve_method(ctx, &prefix, disk.power_off_method, &phys);
+    let base_method = method_override.unwrap_or(disk.power_off_method);
+    let resolved = resolve_method(ctx, &prefix, base_method, &phys);
 
-    // `remove` fully removes the device from its host OS (reversible on spin-up).
-    // It owns its own spin-down + forward teardown, so it replaces the methods
-    // below rather than composing with them.
-    if resolved == PowerOffMethod::Remove {
-        let (method_used, skip_reason) = ("remove", None::<String>);
+    // The forward-aware detach path (device disappears from its host OS, then is
+    // rescanned back on spin-up). `remove` drops the device; `power-off` on a
+    // REMOTE disk must go here too — the ciphertext forward holds the device open,
+    // so it has to be torn down (and rebuilt on spin-up) around the power-off.
+    // These own their spin-down + forward teardown, replacing the match below.
+    let detach = match resolved {
+        PowerOffMethod::Remove => Some(Disappear::Delete),
+        PowerOffMethod::PowerOff if !prefix.is_empty() => Some(Disappear::PowerOff),
+        _ => None,
+    };
+    if let Some(action) = detach {
+        let method_used = action.label();
         if dry {
-            steps.push(json!({"step": "power-down", "device": phys, "method_used": method_used, "planned": "remove device from host OS + record rescan"}));
+            steps.push(json!({"step": "power-down", "device": phys, "method_used": method_used, "planned": "detach device from host OS + record rescan"}));
         } else {
-            steps.push(remove_from_os(ctx, disk)?);
+            steps.push(detach_from_os(ctx, disk, action)?);
             let _ = std::fs::remove_file(ctx.paths.monitor_state(&disk.name));
         }
         return Ok(SpinOutcome::Down(json!({
             "ok": true, "action": "power-off", "name": disk.name,
-            "method_used": method_used, "skip_reason": skip_reason,
+            "method_used": method_used, "skip_reason": null,
             "dry_run": dry, "steps": steps,
         })));
     }
 
     let (method_used, skip_reason) = match resolved {
+        // Local removable disk: udisks powers it off directly (no forward to tear
+        // down; it re-appears on physical replug / udev). Remote power-off is
+        // routed through the detach path above.
         PowerOffMethod::PowerOff => {
             ctx.runner
                 .run_on(
@@ -918,7 +980,7 @@ pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
 
     // Stage 2: fully idle past the power-off window -> unmount + close + power off.
     if idle_secs >= poweroff_to {
-        let sd = spindown(ctx, disk)?; // resets/removes monitor state on success
+        let sd = spindown(ctx, disk, None)?; // resets/removes monitor state on success
         return Ok(json!({
             "ok": true, "action": "power-off", "name": disk.name,
             "io_counter": counter, "idle_secs": idle_secs,
@@ -1082,7 +1144,7 @@ pub fn schedule_tick(ctx: &Context, disk: &Disk, tz_override: Option<&str>) -> R
         }));
     }
 
-    match spindown_impl(ctx, disk, true)? {
+    match spindown_impl(ctx, disk, true, None)? {
         SpinOutcome::Down(sd) => {
             if !dry {
                 let _ = std::fs::remove_file(&state_path);

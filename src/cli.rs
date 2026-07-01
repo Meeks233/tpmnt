@@ -93,7 +93,8 @@ pub enum Command {
     MountRemote(MountRemoteArgs),
     /// Client-side: stop+disable a remote mount unit and unmount it.
     UmountRemote(UmountRemoteArgs),
-    /// Spin a disk down now: unmount + close mapping + power off the platters.
+    /// Power a disk down (default), back up (--on), or set its idle timeouts.
+    /// Spin-down = unmount + close + power off; --on = rescan + open + mount.
     Power(PowerArgs),
     /// Apply disks' on/off schedule now: power up inside the window, down outside.
     Schedule(ScheduleArgs),
@@ -414,9 +415,26 @@ pub struct MountRemoteArgs {
 
 #[derive(Args, Debug)]
 pub struct PowerArgs {
-    /// Name of the [[disk]] to spin down now — or to configure when a timeout
-    /// flag is given. Optional only with --global.
+    /// Name of the [[disk]] to act on — spin it down (default), bring it back up
+    /// (--on), or configure its timeouts (a timeout flag). Optional only with
+    /// --global.
     pub name: Option<String>,
+
+    /// Bring the disk back up now: rescan it back if it was powered off, rebuild
+    /// its ciphertext forward, open (TPM2) and mount it. The inverse of the
+    /// default spin-down.
+    #[arg(long, conflicts_with = "off")]
+    pub on: bool,
+    /// Spin the disk down now (the default action; accepted for symmetry with
+    /// --on).
+    #[arg(long)]
+    pub off: bool,
+    /// One-shot power-down method override, ignoring the disk's configured
+    /// `power_off_method`: "auto", "standby", "sleep", "power-off" (truly cut
+    /// power to the drive/dock — reversible via --on), or "remove" (drop the
+    /// device from its host OS). Only meaningful for the spin-down action.
+    #[arg(long)]
+    pub method: Option<String>,
 
     /// Set the cold-standby standby window (idle time before the platters spin
     /// down, mapping kept). Writes config instead of spinning down now. Applies to
