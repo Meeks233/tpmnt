@@ -585,6 +585,19 @@ fn detach_from_os(ctx: &Context, disk: &Disk, action: Disappear) -> Result<Value
     }))
 }
 
+/// Whether a recorded removal (`forward/<name>.json`) no longer reflects reality
+/// and must be discarded rather than driving a rescan. Stale when the disk's
+/// remote/local binding changed since it was written (a remote→local migration
+/// leaves the record behind), or when a local disk's backing device is already
+/// present again — either way there is nothing to bring back.
+fn removal_record_is_stale(
+    state: &ForwardState,
+    is_remote_now: bool,
+    backing_present: bool,
+) -> bool {
+    state.remote != is_remote_now || (!is_remote_now && backing_present)
+}
+
 /// Reverse `detach_from_os`: rescan the SCSI host to re-probe the disk, wait for
 /// it to reappear, and (for a remote disk) rebuild the ciphertext forward so the
 /// caller can `cryptsetup open` it again. No-op when no removal is recorded.
@@ -597,6 +610,19 @@ fn restore_from_os(ctx: &Context, disk: &Disk) -> Result<Option<Value>> {
     let state: ForwardState = serde_json::from_str(&raw)
         .map_err(|e| Error::new(Code::EInternal, format!("corrupt forward state: {e}")))?;
     let prefix = ctx.config.ssh_prefix_for(disk);
+
+    // Guard against a stale removal record. The disk's binding may have changed
+    // since it was written (e.g. migrated remote→local, leaving the old record
+    // behind), or a local disk may simply be back on the bus already. Either way
+    // there is nothing to restore, and chasing the recorded rescan target would
+    // hang then fail (waiting for a device that never reappears under that name).
+    // Discard the record and let the normal open path proceed.
+    let is_remote_now = !prefix.is_empty();
+    let backing_present = !is_remote_now && Path::new(&disk.device_path()).exists();
+    if removal_record_is_stale(&state, is_remote_now, backing_present) {
+        let _ = std::fs::remove_file(&sp);
+        return Ok(None);
+    }
 
     // 1. Re-probe the disk. `device/delete` leaves the SCSI host in place, so a
     //    host rescan brings it back. A true `udisksctl power-off` can take the
@@ -890,6 +916,34 @@ pub fn forwarded_local_device(ctx: &Context, uuid: &str) -> Option<String> {
     None
 }
 
+/// Whether an active dm-crypt mapping still has a working backing device.
+/// `cryptsetup status` reports a mapping whose underlying device has vanished with
+/// `device: (null)`; such a mapping stays "active" but every read fails. Returns
+/// true when the mapping looks healthy — or can't be inspected — so a probe hiccup
+/// never tears down a good mapping.
+fn mapping_is_live(ctx: &Context, mapper: &str) -> bool {
+    match ctx.runner.probe(
+        &["cryptsetup", "status", mapper],
+        "check LUKS mapping backing device",
+    ) {
+        Ok(out) if out.ok() => !mapping_backing_is_dead(&out.stdout),
+        _ => true,
+    }
+}
+
+/// Parse `cryptsetup status` output: true when the `device:` line reads `(null)`
+/// or is empty, i.e. the mapping's backing device is gone (a dead mapping). No
+/// `device:` line at all is treated as live (don't destroy what we can't judge).
+fn mapping_backing_is_dead(status: &str) -> bool {
+    for line in status.lines() {
+        if let Some(rest) = line.trim().strip_prefix("device:") {
+            let dev = rest.trim();
+            return dev.is_empty() || dev == "(null)";
+        }
+    }
+    false
+}
+
 fn local_container(ctx: &Context, disk: &Disk) -> Result<String> {
     if ctx.config.ssh_prefix_for(disk).is_empty() {
         return Ok(disk.device_path());
@@ -937,7 +991,25 @@ pub fn spinup(ctx: &Context, disk: &Disk) -> Result<Value> {
             // path, a remote disk at the local NBD device forwarding its
             // ciphertext (the config `device` names it on the *remote* host).
             let container = local_container(ctx, disk)?;
-            if Path::new(&mapper_dev).exists() && !dry {
+            // A mapper node can exist yet be dead: if its backing device was
+            // removed, or the disk re-enumerated to a new /dev node, the dm-crypt
+            // target points at a vanished device and every read fails ("can't read
+            // superblock"). Detect that and close it so we re-open against the live
+            // container instead of mounting a corpse.
+            let mut already_open = Path::new(&mapper_dev).exists() && !dry;
+            if already_open && !mapping_is_live(ctx, &mapper) {
+                ctx.runner
+                    .run(
+                        &["cryptsetup", "close", &mapper],
+                        "close stale LUKS mapping (backing device gone)",
+                    )?
+                    .require("cryptsetup close")?;
+                steps.push(
+                    json!({"step": "cryptsetup-close", "mapper": mapper, "reason": "stale-backing"}),
+                );
+                already_open = false;
+            }
+            if already_open {
                 steps.push(
                     json!({"step": "cryptsetup-open", "mapper": mapper, "skipped": "already open"}),
                 );
@@ -1520,6 +1592,51 @@ pub fn reconcile_monitor_unit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dead_mapping_detected_from_null_backing_device() {
+        // Healthy mapping: a real backing device.
+        let live = "/dev/mapper/tpmnt-x is active.\n  type:    LUKS2\n  \
+                    cipher:  aes-xts-plain64\n  device:  /dev/sdc\n  sector size:  4096\n";
+        assert!(!mapping_backing_is_dead(live));
+
+        // Stale mapping after the backing device vanished / the disk re-enumerated:
+        // still "active", but `device:` is (null) — reads fail.
+        let dead = "/dev/mapper/tpmnt-x is active.\n  type:    n/a\n  \
+                    key location: keyring\n  device:  (null)\n  sector size:  4096\n";
+        assert!(mapping_backing_is_dead(dead));
+
+        // No `device:` line at all -> treated as live (don't tear down blindly).
+        assert!(!mapping_backing_is_dead("/dev/mapper/tpmnt-x is active.\n"));
+    }
+
+    fn removal_state(remote: bool) -> ForwardState {
+        ForwardState {
+            remote,
+            remote_dev: "/dev/sdb".into(),
+            scsi_host: "host7".into(),
+            port: 10809,
+            powered_off: true,
+        }
+    }
+
+    #[test]
+    fn removal_record_stale_when_binding_migrated_remote_to_local() {
+        let state = removal_state(true);
+        // Record says remote, but the disk is local now (migrated) -> discard it.
+        assert!(removal_record_is_stale(&state, false, false));
+        // Record says remote and the disk is still remote -> honor it (rescan).
+        assert!(!removal_record_is_stale(&state, true, false));
+    }
+
+    #[test]
+    fn removal_record_stale_when_local_disk_already_present() {
+        let state = removal_state(false);
+        // Local disk already back on the bus -> nothing to restore.
+        assert!(removal_record_is_stale(&state, false, true));
+        // Local disk still genuinely absent -> honor the record and rescan.
+        assert!(!removal_record_is_stale(&state, false, false));
+    }
 
     #[test]
     fn physical_device_strips_only_real_partitions() {
