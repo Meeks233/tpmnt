@@ -32,6 +32,12 @@ impl Paths {
         self.at("etc/systemd/system")
     }
 
+    /// Directory for udev rules tpmnt installs (e.g. hiding NBD ciphertext
+    /// transport devices from udisks/the desktop file manager).
+    pub fn udev_rules_dir(&self) -> PathBuf {
+        self.at("etc/udev/rules.d")
+    }
+
     /// Directory where LUKS header backups and config .bak files are stored.
     pub fn backup_dir(&self) -> PathBuf {
         self.at("var/lib/tpmnt/backups")

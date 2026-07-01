@@ -66,6 +66,13 @@ pub fn run(ctx: &Context) -> Result<Value> {
             dry,
         )?;
 
+        // A transport-backed (NBD-forwarded) disk exposes its raw ciphertext as
+        // /dev/nbdN; hide it from udisks so the file manager shows only the named,
+        // decrypted mount rather than a duplicate "unlock me" disk.
+        if disk.transport.is_some() {
+            super::ensure_nbd_hidden(ctx, dry)?;
+        }
+
         // Reconcile the cold-standby idle-monitor unit (written for cold-standby,
         // removed for always-on).
         let monitor_change =

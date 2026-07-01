@@ -346,6 +346,11 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
             ctx.config.defaults.mount_backend,
             dry,
         )?;
+        // For a transport-backed disk, hide the raw /dev/nbdN ciphertext device
+        // from udisks so the file manager shows only the named decrypted mount.
+        if disk.transport.is_some() {
+            super::ensure_nbd_hidden(ctx, dry)?;
+        }
         // Mount now (the mapper is already open), with the SAME options reconcile
         // wrote to fstab — so the live mount matches steady state (noatime for
         // cold-standby, compress=zstd for btrfs) instead of bare defaults.

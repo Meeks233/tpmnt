@@ -213,6 +213,49 @@ fn write_mount_unit(unit_dir: &Path, disk: &Disk, dry_run: bool) -> Result<FileC
     })
 }
 
+/// The udev rule that hides forwarded ciphertext transport devices from udisks.
+/// An NBD-attached managed disk exposes its *raw LUKS ciphertext* as `/dev/nbdN`,
+/// which udisks would otherwise surface in the desktop file manager as a second,
+/// unnamed "unlock me" disk — a duplicate of the decrypted, named mount. Marking
+/// `UDISKS_IGNORE=1` drops that raw device, leaving only the real mount visible.
+const NBD_UDISKS_RULE: &str = "\
+# tpmnt: managed NBD devices carry forwarded LUKS ciphertext — transport plumbing,
+# not user-facing volumes. Hide them from udisks so the file manager shows only the
+# decrypted, named mount instead of a second disk for the raw ciphertext device.
+KERNEL==\"nbd*\", ENV{UDISKS_IGNORE}=\"1\"
+";
+
+/// Rule filename under the udev rules dir. `60-` orders it before udisks' own
+/// defaults but after low-level device setup.
+pub const NBD_UDISKS_RULE_FILE: &str = "60-tpmnt-nbd.rules";
+
+/// Write the udev rule that hides NBD ciphertext devices from udisks. Idempotent:
+/// create/update/noop like the other reconciled files. Callers should reload udev
+/// (`udevadm control --reload && udevadm trigger`) when this reports a change so
+/// the rule applies to an already-attached device.
+pub fn reconcile_nbd_udisks_hide(rules_dir: &Path, dry_run: bool) -> Result<FileChange> {
+    let path = rules_dir.join(NBD_UDISKS_RULE_FILE);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let action = if existing.is_empty() {
+        "create"
+    } else if existing != NBD_UDISKS_RULE {
+        "update"
+    } else {
+        "noop"
+    };
+    if action != "noop" && !dry_run {
+        std::fs::create_dir_all(rules_dir)
+            .map_err(|e| Error::new(Code::EInternal, format!("mkdir udev rules dir: {e}")))?;
+        std::fs::write(&path, NBD_UDISKS_RULE)
+            .map_err(|e| Error::new(Code::EInternal, format!("write udev rule: {e}")))?;
+    }
+    Ok(FileChange {
+        path: path.display().to_string(),
+        action,
+        line: NBD_UDISKS_RULE_FILE.to_string(),
+    })
+}
+
 /// Remove the tagged line for `name` from a file (used by rollback).
 pub fn remove_tagged_line(path: &Path, name: &str, dry_run: bool) -> Result<FileChange> {
     let existing = std::fs::read_to_string(path).unwrap_or_default();
@@ -317,6 +360,31 @@ mod tests {
             fstab_line(&d),
             "/dev/mapper/tpmnt-data /mnt/data xfs defaults,nofail,_netdev,noatime 0 0"
         );
+    }
+
+    #[test]
+    fn nbd_udisks_hide_rule_is_idempotent_and_ignores_nbd() {
+        let dir = std::env::temp_dir().join(format!("tpmnt-udev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let c1 = reconcile_nbd_udisks_hide(&dir, false).unwrap();
+        assert_eq!(c1.action, "create");
+        let c2 = reconcile_nbd_udisks_hide(&dir, false).unwrap();
+        assert_eq!(c2.action, "noop");
+
+        let body = std::fs::read_to_string(dir.join(NBD_UDISKS_RULE_FILE)).unwrap();
+        assert!(body.contains("KERNEL==\"nbd*\""));
+        assert!(body.contains("UDISKS_IGNORE"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn nbd_udisks_hide_dry_run_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("tpmnt-udev-dry-{}", std::process::id()));
+        let c = reconcile_nbd_udisks_hide(&dir, true).unwrap();
+        assert_eq!(c.action, "create");
+        assert!(!dir.join(NBD_UDISKS_RULE_FILE).exists());
     }
 
     #[test]

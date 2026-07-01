@@ -31,6 +31,37 @@ pub struct Context {
     pub env: EnvInfo,
 }
 
+/// Ensure the udev rule hiding NBD ciphertext-transport devices from udisks is
+/// installed, and (when it was just written) reload udev so an already-attached
+/// `/dev/nbdN` is re-evaluated and dropped from the desktop file manager. Called
+/// during reconcile for transport-backed disks. Returns the file change for
+/// --plan/--dry-run reporting.
+pub fn ensure_nbd_hidden(
+    ctx: &Context,
+    dry: bool,
+) -> crate::error::Result<crate::reconcile::FileChange> {
+    let change = crate::reconcile::reconcile_nbd_udisks_hide(&ctx.paths.udev_rules_dir(), dry)?;
+    if change.action != "noop" && !dry {
+        // Reload rules and re-trigger block devices so the new rule takes effect
+        // on already-present nbd devices without a reboot. Best-effort: a missing
+        // udevadm (rare) shouldn't fail the whole reconcile.
+        let _ = ctx.runner.run(
+            &["udevadm", "control", "--reload-rules"],
+            "reload udev rules",
+        );
+        let _ = ctx.runner.run(
+            &[
+                "udevadm",
+                "trigger",
+                "--subsystem-match=block",
+                "--sysname-match=nbd*",
+            ],
+            "re-trigger nbd devices so udisks re-reads UDISKS_IGNORE",
+        );
+    }
+    Ok(change)
+}
+
 impl Context {
     pub fn new(global: GlobalOpts, config: Config) -> Self {
         let runner = Runner::new(global.effective_dry_run(), global.debug);
