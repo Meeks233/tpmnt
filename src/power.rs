@@ -1,7 +1,10 @@
 //! Per-disk power management for the `cold-standby` profile: detect *real* block
 //! I/O on the decrypted mapper, and when a disk has been idle past its window,
 //! spin the platters down to *standby* (mapping kept open; transparent wake on
-//! next access) to stop needless platter wear. The disk then rests at standby —
+//! next access) to stop needless platter wear. Directly-attached SATA disks park
+//! via ATA STANDBY (`hdparm -y`); USB-bridged disks (whose bridge silently
+//! ignores ATA standby) via a SCSI STOP UNIT (`sg_start --stop`). The disk then
+//! rests at standby —
 //! tpmnt never auto-powers-off, because standby already captures ~all the
 //! HDD-lifespan benefit a full power-off would (a wake costs the same start/stop
 //! cycle either way) without the physical-reload cost. Full power-off / OS
@@ -117,6 +120,33 @@ fn is_removable(ctx: &Context, prefix: &[String], phys: &str) -> bool {
     sys_flag(ctx, prefix, phys, "removable")
 }
 
+/// Whether the disk sits behind a USB transport (e.g. a USB-SATA bridge like the
+/// JMicron JMS567). Read on the disk's host by resolving `/sys/block/<dev>/device`
+/// to its full sysfs path and looking for a `usb` component. This matters because
+/// USB bridges translate SCSI<->ATA and, crucially, *silently drop* ATA STANDBY
+/// IMMEDIATE (`hdparm -y`) — they ACK it and even report `standby` for `hdparm -C`
+/// while the motor keeps spinning. Such disks must be parked with a SCSI STOP
+/// UNIT instead. Reports `removable=0`, so it is not caught by `is_removable`.
+fn is_usb_attached(ctx: &Context, prefix: &[String], phys: &str) -> bool {
+    let base = phys.rsplit('/').next().unwrap_or(phys);
+    let link = format!("/sys/block/{base}/device");
+    let full = if prefix.is_empty() {
+        std::fs::canonicalize(&link)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else {
+        ctx.runner
+            .probe_on(
+                prefix,
+                &["readlink", "-f", &link],
+                "resolve device transport",
+            )
+            .map(|o| o.stdout.trim().to_string())
+            .unwrap_or_default()
+    };
+    full.split('/').any(|c| c == "usb" || c.starts_with("usb"))
+}
+
 /// Pick the concrete power-down action for `auto`, given the device's traits
 /// (read on the disk's host, local or remote).
 fn resolve_method(
@@ -228,17 +258,45 @@ fn tune_spindown_authority(ctx: &Context, disk: &Disk) -> Value {
     }
 }
 
+/// The spin-down command for a disk, honoring its transport. A USB-SATA bridge
+/// silently drops ATA STANDBY IMMEDIATE (`hdparm -y`) — it ACKs the command and
+/// even reports `standby` for `hdparm -C`, yet never stops the motor — so a
+/// USB-attached disk is parked with a SCSI STOP UNIT (`sg_start --stop`), which
+/// the bridge honors and which keeps the device present so the next I/O
+/// transparently spins it back up. A directly-attached SATA disk uses `hdparm -y`.
+/// Returns (argv, why, method-label, tool). `sg_start` ships in sg3_utils — a
+/// USB cold-standby disk needs it on its host; without it the park is a no-op the
+/// caller records honestly rather than silently claiming success.
+fn spindown_argv(usb: bool, phys: &str) -> (Vec<&str>, &'static str, &'static str, &'static str) {
+    if usb {
+        (
+            vec!["sg_start", "--stop", phys],
+            "spin down USB-bridged disk (SCSI STOP UNIT; ATA standby is ignored by the bridge)",
+            "sg_start --stop",
+            "sg_start",
+        )
+    } else {
+        (
+            vec!["hdparm", "-y", phys],
+            "spin platters down to standby (mapping kept open; wakes on next access)",
+            "hdparm -y",
+            "hdparm",
+        )
+    }
+}
+
 /// Stage 1 of cold-standby idle handling: spin the platters down to standby but
 /// leave the LUKS mapping + mount in place, so the next real access transparently
-/// wakes the drive. Uses `hdparm -y` (STANDBY IMMEDIATE, auto-wakes on I/O) and
-/// only for fixed rotational disks — SSD/loop have no platters, and removable/USB
-/// disks wait for the full power-off stage instead. Best-effort: an unsupported
-/// drive/bridge fails harmlessly (recorded, never fatal). Acts on the disk's host.
+/// wakes the drive. Directly-attached SATA disks use `hdparm -y` (ATA STANDBY
+/// IMMEDIATE); USB-bridged disks use `sg_start --stop` (SCSI STOP UNIT) because
+/// the bridge silently ignores ATA standby. Only for fixed rotational disks —
+/// SSD/loop have no platters. Best-effort: an unsupported drive/bridge (or a
+/// missing tool) fails harmlessly (recorded, never fatal). Acts on the disk's host.
 fn enter_standby(ctx: &Context, disk: &Disk) -> Value {
     let (phys, prefix) = phys_and_prefix(ctx, disk);
     let dry = ctx.global.effective_dry_run();
     // Same predicate as APM tuning: only fixed rotational disks have platters to
-    // park; SSD/loop and removable/USB disks wait for the power-off stage.
+    // park; SSD/loop disks have nothing to spin down.
     if !dry
         && !should_tune_apm(
             is_rotational(ctx, &prefix, &phys),
@@ -247,17 +305,15 @@ fn enter_standby(ctx: &Context, disk: &Disk) -> Value {
     {
         return json!({"step": "standby", "device": phys, "skipped": "not a fixed rotational disk"});
     }
-    match ctx.runner.run_on(
-        &prefix,
-        &priv_argv(&prefix, &["hdparm", "-y", &phys]),
-        "spin platters down to standby (mapping kept open; wakes on next access)",
-    ) {
-        Ok(out) if out.ok() => json!({"step": "standby", "device": phys, "method": "hdparm -y"}),
+    let usb = !dry && is_usb_attached(ctx, &prefix, &phys);
+    let (argv, why, method, tool) = spindown_argv(usb, &phys);
+    match ctx.runner.run_on(&prefix, &priv_argv(&prefix, &argv), why) {
+        Ok(out) if out.ok() => json!({"step": "standby", "device": phys, "method": method}),
         Ok(out) => {
-            json!({"step": "standby", "device": phys, "skipped": "standby unsupported", "stderr": out.stderr.trim()})
+            json!({"step": "standby", "device": phys, "skipped": "standby unsupported", "method": method, "stderr": out.stderr.trim()})
         }
         Err(e) => {
-            json!({"step": "standby", "device": phys, "skipped": "hdparm unavailable", "error": e.message})
+            json!({"step": "standby", "device": phys, "skipped": format!("{tool} unavailable"), "error": e.message})
         }
     }
 }
@@ -1580,6 +1636,21 @@ mod tests {
         // SSD / loop (non-rotational) => skip: no platters to park.
         assert!(!should_tune_apm(false, false));
         assert!(!should_tune_apm(false, true));
+    }
+
+    #[test]
+    fn spindown_picks_scsi_stop_for_usb_disks() {
+        // USB-bridged disk: ATA standby is silently dropped by the bridge, so use
+        // a SCSI STOP UNIT (sg_start --stop) that the bridge actually honors.
+        let (argv, _why, method, tool) = spindown_argv(true, "/dev/sda");
+        assert_eq!(argv, vec!["sg_start", "--stop", "/dev/sda"]);
+        assert_eq!(method, "sg_start --stop");
+        assert_eq!(tool, "sg_start");
+        // Directly-attached SATA disk: ATA STANDBY IMMEDIATE works.
+        let (argv, _why, method, tool) = spindown_argv(false, "/dev/sdb");
+        assert_eq!(argv, vec!["hdparm", "-y", "/dev/sdb"]);
+        assert_eq!(method, "hdparm -y");
+        assert_eq!(tool, "hdparm");
     }
 
     #[test]
