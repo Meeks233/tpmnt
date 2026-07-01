@@ -95,9 +95,16 @@ pub fn crypttab_line(disk: &Disk) -> String {
 /// Mount options for a disk. Cold-standby disks get `noatime` so that reads
 /// don't generate atime writes that would mask idleness from the power monitor.
 /// btrfs (the cold-backup default) also gets `compress=zstd:3` for archival
-/// density — transparent, low-CPU, and applied to new writes.
+/// density — transparent, low-CPU, and applied to new writes. A transport-backed
+/// disk (its ciphertext is forwarded here over the network, e.g. NBD-over-SSH)
+/// gets `_netdev`: it's network-backed storage, so systemd must order it under
+/// `remote-fs.target` (after the network is up) rather than `local-fs.target`.
+/// That's also how the OS *recognizes it as remote* rather than a local disk.
 pub fn mount_options(disk: &Disk) -> String {
     let mut opts = vec!["defaults", "nofail"];
+    if disk.transport.is_some() {
+        opts.push("_netdev");
+    }
     if disk.is_cold_standby() {
         opts.push("noatime");
     }
@@ -107,10 +114,11 @@ pub fn mount_options(disk: &Disk) -> String {
     opts.join(",")
 }
 
-/// fstab fsck pass field: btrfs does its own integrity checking and must not be
-/// fsck'd at boot (pass 0); other filesystems get a normal secondary pass (2).
+/// fstab fsck pass field: btrfs does its own integrity checking, and a
+/// network-backed (`_netdev`) device can't be fsck'd at boot before the network
+/// exists — both take pass 0. Everything else gets a normal secondary pass (2).
 fn fsck_pass(disk: &Disk) -> u8 {
-    if disk.fstype == "btrfs" {
+    if disk.fstype == "btrfs" || disk.transport.is_some() {
         0
     } else {
         2
@@ -294,6 +302,20 @@ mod tests {
         assert_eq!(
             fstab_line(&d),
             "/dev/mapper/tpmnt-data /mnt/data btrfs defaults,nofail,noatime,compress=zstd:3 0 0"
+        );
+    }
+
+    #[test]
+    fn transport_backed_disk_is_netdev_remote_fs() {
+        // An NBD-forwarded disk is network-backed: it must be _netdev (so systemd
+        // files it under remote-fs.target, i.e. the OS treats it as remote) and
+        // must not be fsck'd at boot (pass 0).
+        let mut d = disk();
+        d.transport = Some(crate::config::Transport::Nbd);
+        d.power_profile = crate::config::PowerProfile::ColdStandby;
+        assert_eq!(
+            fstab_line(&d),
+            "/dev/mapper/tpmnt-data /mnt/data xfs defaults,nofail,_netdev,noatime 0 0"
         );
     }
 
