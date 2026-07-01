@@ -122,6 +122,19 @@ pub fn run(ctx: &Context, args: &RenameArgs) -> Result<Value> {
                 .require("dmsetup rename")?;
             steps.push(json!({"step": "dmsetup-rename", "from": old_mapper, "to": new_mapper}));
         }
+
+        // Relabel the filesystem to the new name. This is the layer the desktop
+        // actually shows: UDisks/Dolphin display ID_FS_LABEL, not the mapper or
+        // mountpoint. Done here while the fs is unmounted, on the (renamed) mapper
+        // device. Best-effort — a cosmetic label failure must not undo the rename.
+        let new_mapper_dev = format!("/dev/mapper/{new_mapper}");
+        match relabel_fs(ctx, &new.fstype, &new_mapper_dev, &args.new, dry) {
+            Ok(Some(())) => steps.push(json!({"step": "relabel", "label": args.new})),
+            Ok(None) => steps.push(
+                json!({"step": "relabel", "skipped": format!("no relabel tool for {}", new.fstype)}),
+            ),
+            Err(e) => steps.push(json!({"step": "relabel", "warning": e.message})),
+        }
     }
 
     // 2. Reconcile the declarative files under the new name and drop the old
@@ -205,6 +218,54 @@ pub fn run(ctx: &Context, args: &RenameArgs) -> Result<Value> {
         "remounted": remounted,
         "steps": steps,
     }))
+}
+
+/// Set the filesystem label on `device` to `label` so the desktop (UDisks/Dolphin
+/// read `ID_FS_LABEL`) shows the disk's new name. Per-fstype tool; returns
+/// `Ok(None)` for a filesystem we don't know how to relabel. The device must be
+/// unmounted for xfs/ext; btrfs also accepts an offline device here. On success a
+/// udev refresh is triggered so UDisks re-reads the label without a replug.
+fn relabel_fs(
+    ctx: &Context,
+    fstype: &str,
+    device: &str,
+    label: &str,
+    dry: bool,
+) -> Result<Option<()>> {
+    let argv = match relabel_argv(fstype, device, label) {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
+    ctx.runner
+        .run(&argv_ref, "set filesystem label to the new name")?
+        .require("relabel filesystem")?;
+    if !dry {
+        // Re-read the block device so UDisks picks up the new ID_FS_LABEL.
+        let _ = ctx.runner.run(
+            &["udevadm", "trigger", "--settle", "--action=change", device],
+            "refresh udev so the file manager re-reads the label",
+        );
+    }
+    Ok(Some(()))
+}
+
+/// The per-fstype relabel command, or `None` for a filesystem we don't relabel.
+/// btrfs relabels offline by device; xfs/ext by their label tools.
+fn relabel_argv(fstype: &str, device: &str, label: &str) -> Option<Vec<String>> {
+    let s = |v: &str| v.to_string();
+    match fstype {
+        "btrfs" => Some(vec![
+            s("btrfs"),
+            s("filesystem"),
+            s("label"),
+            s(device),
+            s(label),
+        ]),
+        "xfs" => Some(vec![s("xfs_admin"), s("-L"), s(label), s(device)]),
+        "ext2" | "ext3" | "ext4" => Some(vec![s("e2label"), s(device), s(label)]),
+        _ => None,
+    }
 }
 
 /// Update the name/mapper/mountpoint fields inside a key bundle JSON to match the
@@ -298,6 +359,38 @@ mod tests {
         // Secrets carried over untouched.
         assert_eq!(v["passphrase"], "secret-pass");
         assert_eq!(v["recovery_key"], "rk-123");
+    }
+
+    #[test]
+    fn relabel_argv_picks_the_right_tool_per_fs() {
+        // btrfs: label the device offline.
+        assert_eq!(
+            relabel_argv("btrfs", "/dev/mapper/tpmnt-new", "new"),
+            Some(vec![
+                "btrfs".into(),
+                "filesystem".into(),
+                "label".into(),
+                "/dev/mapper/tpmnt-new".into(),
+                "new".into()
+            ])
+        );
+        // xfs: xfs_admin -L <label> <dev>.
+        assert_eq!(
+            relabel_argv("xfs", "/dev/x", "lbl"),
+            Some(vec![
+                "xfs_admin".into(),
+                "-L".into(),
+                "lbl".into(),
+                "/dev/x".into()
+            ])
+        );
+        // ext*: e2label <dev> <label>.
+        assert_eq!(
+            relabel_argv("ext4", "/dev/x", "lbl"),
+            Some(vec!["e2label".into(), "/dev/x".into(), "lbl".into()])
+        );
+        // Unknown fs: no relabel.
+        assert_eq!(relabel_argv("zfs", "/dev/x", "lbl"), None);
     }
 
     #[test]
