@@ -1006,6 +1006,66 @@ fn decide_idle(
     IdleAction::Wait
 }
 
+/// Handle a tick where the LUKS mapper is closed. A closed mapper is *not*
+/// evidence the platters are parked: with `x-systemd.automount` teardown (or
+/// before the mount is ever triggered) the dm-crypt mapping is absent while the
+/// raw backing disk keeps spinning. So park the physical disk to standby, unless
+/// it has been genuinely detached / powered off (device node gone) — that we
+/// leave alone, both because there is nothing to park and because probing it
+/// could bring it back on the bus. Idempotent: the persisted `standby` flag gates
+/// re-issuing `hdparm -y`; a real access reopens the mapper and the open path
+/// clears the flag, so the next close re-parks.
+fn park_closed_disk(ctx: &Context, disk: &Disk) -> Result<Value> {
+    let (phys, prefix) = phys_and_prefix(ctx, disk);
+
+    // Truly detached / powered off: nothing to park, and don't wake it.
+    if !host_exists(ctx, &prefix, &phys) {
+        return Ok(json!({
+            "ok": true, "action": "down", "name": disk.name,
+            "reason": "mapper closed and backing device absent; disk already down",
+        }));
+    }
+
+    // Only fixed rotational disks have platters to park (SSD/loop: nothing to do;
+    // removable: parking isn't its power-down path).
+    if !should_tune_apm(
+        is_rotational(ctx, &prefix, &phys),
+        is_removable(ctx, &prefix, &phys),
+    ) {
+        return Ok(json!({
+            "ok": true, "action": "down", "name": disk.name,
+            "reason": "mapper closed; backing disk has no platters to park",
+        }));
+    }
+
+    // Park once per closed stretch: the persisted `standby` flag guards against
+    // re-sending `hdparm -y` every tick.
+    let state_path = ctx.paths.monitor_state(&disk.name);
+    if load_state(&state_path).map(|s| s.standby).unwrap_or(false) {
+        return Ok(json!({
+            "ok": true, "action": "keep", "name": disk.name,
+            "reason": "mapper closed; already resting at standby",
+        }));
+    }
+
+    let standby = enter_standby(ctx, disk);
+    if !ctx.global.effective_dry_run() {
+        save_state(
+            &state_path,
+            &MonitorState {
+                counter: 0,
+                last_change: now_epoch(),
+                standby: true,
+            },
+        );
+    }
+    Ok(json!({
+        "ok": true, "action": "standby", "name": disk.name,
+        "reason": "mapper closed; parked idle backing disk",
+        "standby": standby,
+    }))
+}
+
 /// One monitor tick: observe real I/O, update idle state, and spin the platters
 /// down to standby if the disk has been idle past its window (then rest there).
 /// Idempotent and safe to call on a repeat.
@@ -1017,13 +1077,15 @@ pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
         }));
     }
 
-    // Nothing to monitor if the mapping isn't open (disk already down).
+    // A closed mapper does NOT mean the platters are parked. With
+    // `x-systemd.automount` teardown — or simply before the mount is ever
+    // triggered — the dm-crypt mapping is absent while the raw backing disk keeps
+    // spinning (closing/never-opening a dm-crypt target issues no ATA STANDBY). So
+    // when the mapper is down we still park the physical disk instead of assuming
+    // it is already powered down.
     let mapper = disk.mapper_name();
     if !Path::new(&format!("/dev/mapper/{mapper}")).exists() {
-        return Ok(json!({
-            "ok": true, "action": "down", "name": disk.name,
-            "reason": "mapper not open; disk already powered down",
-        }));
+        return park_closed_disk(ctx, disk);
     }
 
     let standby_to = disk.standby_timeout_secs(&ctx.config.defaults);
