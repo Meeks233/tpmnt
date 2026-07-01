@@ -27,38 +27,29 @@ declarative config + idempotent reconciliation around them. It never reimplement
 
 ## Install
 
-### Prebuilt static binary (recommended — zero library dependencies)
+`tpmnt` is an orchestrator that shells out to standard system tools (cryptsetup, systemd, hdparm,
+gnupg, …), so it installs as a proper **`.deb` / `.rpm`** that pulls those tools in as dependencies
+— nothing to wire up by hand. Every stable `v*` tag attaches packages for `x86_64` and `aarch64`;
+each push also refreshes a rolling [`edge` pre-release](https://github.com/Meeks233/tpmnt/releases/tag/edge).
 
-`tpmnt` is a single **static musl binary**: no shared libraries, no glibc version to match,
-nothing to pull into your system. It runs as-is on any Linux distro (Debian, Ubuntu, Fedora,
-Arch, …). Copy-paste to fetch the latest **stable** release into `/usr/local/bin`:
+### Debian / Ubuntu (.deb) — recommended
 
 ```sh
-set -e
-arch=$(uname -m); case "$arch" in
-  x86_64)        target=x86_64-unknown-linux-musl ;;
-  aarch64|arm64) target=aarch64-unknown-linux-musl ;;
-  *) echo "unsupported arch: $arch" >&2; exit 1 ;;
+arch=$(dpkg --print-architecture); case "$arch" in
+  amd64) t=x86_64-unknown-linux-gnu ;; arm64) t=aarch64-unknown-linux-gnu ;;
 esac
-url=$(curl -fsSL https://api.github.com/repos/Meeks233/tpmnt/releases/latest \
-  | grep -o "https://[^\"]*-${target}\.tar\.gz" | head -n1)
-curl -fsSL "$url" | tar -xz -C /tmp
-sudo install -m 0755 /tmp/tpmnt-*-${target}/tpmnt /usr/local/bin/tpmnt
-tpmnt --version
+curl -fsSLO "https://github.com/Meeks233/tpmnt/releases/latest/download/tpmnt-${t}.deb"
+sudo apt install "./tpmnt-${t}.deb"   # apt resolves cryptsetup/hdparm/gnupg/… automatically
 ```
 
-> Every commit also publishes a rolling `edge` build as a **pre-release**. The command above
-> uses GitHub's `releases/latest` endpoint, which excludes pre-releases, so it only ever fetches
-> a vetted, tagged stable release. To try the bleeding edge, grab a `tpmnt-edge-…` asset from the
-> [`edge` pre-release](https://github.com/Meeks233/tpmnt/releases/tag/edge).
-
-### Debian / Ubuntu (.deb)
-
-Each stable release also ships a `.deb` (declares its system-tool deps via apt):
+### Fedora / RHEL / openSUSE (.rpm) — recommended
 
 ```sh
-curl -fsSLO https://github.com/Meeks233/tpmnt/releases/latest/download/tpmnt-x86_64-unknown-linux-gnu.deb
-sudo apt install ./tpmnt-x86_64-unknown-linux-gnu.deb
+arch=$(uname -m); case "$arch" in
+  x86_64) t=x86_64-unknown-linux-gnu ;; aarch64) t=aarch64-unknown-linux-gnu ;;
+esac
+curl -fsSLO "https://github.com/Meeks233/tpmnt/releases/latest/download/tpmnt-${t}.rpm"
+sudo dnf install "./tpmnt-${t}.rpm"   # dnf resolves the tool dependencies automatically
 ```
 
 ### Fedora / RHEL / openSUSE (COPR)
@@ -100,14 +91,16 @@ cargo install --path .
 
 ### Runtime dependencies (no dependency hell)
 
-tpmnt is an **orchestrator**: the binary itself links nothing but libc (and *nothing at all* in
-the static musl build). At runtime it shells out to standard system tools that ship with — or are
-one `apt`/`dnf install` from — every distro. None are obscure or version-fragile:
+tpmnt is an **orchestrator**: the binary links nothing but libc. At runtime it shells out to
+standard system tools — and the `.deb`/`.rpm` **declare them as package dependencies**, so your
+package manager pulls them in. None are obscure or version-fragile:
 
-- **always:** `cryptsetup`, `systemd` (provides `systemd-cryptenroll` / `systemd-cryptsetup`), a TPM2 at `/dev/tpmrm0`
-- **`init`:** `gdisk` (sgdisk) + a filesystem tool (`mkfs.xfs` / `mkfs.ext4` / …)
-- **`mount-remote`:** `sshfs` + `fusermount3`
-- **auto-discovery / remote transport:** `blkid` (locate disks by UUID), `qemu-nbd` + `nbd-client` (forward remote ciphertext)
+- **always (Depends):** `cryptsetup`, `systemd` (`systemd-cryptenroll` / `systemd-cryptsetup`), `util-linux`, `gdisk`, `btrfs-progs`, `sudo`, a TPM2 at `/dev/tpmrm0`
+- **cold-standby spindown (Depends):** `hdparm` (SATA ATA-standby); `sg3_utils` for USB-bridged disks (Recommends)
+- **mandatory PIN vault (Depends):** `gnupg`
+- **other filesystems (Recommends):** `xfsprogs`, `e2fsprogs`
+- **remote disks / `mount-remote` (Recommends):** `openssh-client`, `sshfs` + `fuse3`, `nbd-client`; `qemu-utils` (Suggests) only on a host that *serves* its disk to others
+- **power-off method / discovery:** `udisks2`, `parted`, `procps`; `blkid` (locate disks by UUID)
 - **PIN vault:** `gpg` (encrypts the unified recovery vault under your PIN)
 - **optional:** `age` or `gpg` (encrypted key escrow), `hdparm` (power profiles)
 
@@ -622,9 +615,9 @@ cross-platform binaries and publishes them to the rolling `edge` **pre-release**
 locally:
 
 ```sh
-./target/release/tpmnt gen-man man                      # regenerate man/tpmnt.1
-cargo build --release --target x86_64-unknown-linux-musl # fully static, dependency-free binary
-cargo install cargo-deb && cargo deb                     # build an installable .deb
+./target/release/tpmnt gen-man man                        # regenerate man/tpmnt.1 (committed)
+cargo install cargo-deb && cargo deb                      # build an installable .deb
+cargo install cargo-generate-rpm && cargo generate-rpm --auto-req disabled   # build an .rpm
 ```
 
 Distro-repository recipes (COPR, PPA, AUR, Nix) live under [`packaging/`](packaging/), one

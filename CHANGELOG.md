@@ -4,7 +4,7 @@ All notable changes to tpmnt are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] - 2026-07-01
 
 ### Added
 
@@ -15,12 +15,30 @@ All notable changes to tpmnt are documented here. The format follows
 
 ### Changed
 
+- **Distribution is now dependency-based packages, not standalone binaries.** Releases ship `.deb`
+  (apt) and `.rpm` (dnf/zypper) that declare the runtime tools tpmnt orchestrates, so features work
+  out of the box. `Depends`/`Requires` cover the core enroll→unlock→mount path plus the default
+  cold-standby spindown (**hdparm**) and the mandatory PIN vault (**gnupg**); `Recommends` cover
+  feature-specific tools (sg3_utils for USB spindown, xfsprogs/e2fsprogs, nbd/sshfs/openssh for
+  remote disks, udisks2, parted, procps). The pure static-binary release path was dropped.
 - **Auto-discovery is now lazy and batched — no more per-remote flooding.** `discover` (and the
   discovery baked into `apply`/`migrate`) no longer probes every remote for every disk. It
   inventories this host once (`blkid -o export`), trusts a disk's last-known remote binding without
   probing, and only when a disk expected *here* has genuinely vanished does it perform a **single
   global sweep** (one `blkid` per remote, all UUIDs compared at once). Cost drops from `N × M` probes
   to at most `1 + M` for N disks across M remotes.
+
+### Fixed
+
+- **`adopt` now takes true TPM2 ownership.** A disk carrying a foreign/stale TPM2 token is force
+  re-enrolled to *this* host's TPM. The wipe runs as its own `systemd-cryptenroll --wipe-slot=tpm2`
+  step — a combined `--wipe-slot=tpm2 --tpm2-device=auto` no-ops ("already enrolled") when the stale
+  token binds the same PCR set, which previously left auto-unlock broken ("Object is remote").
+- **Local disks survive re-enumeration.** `adopt` registers a local disk with no pinned `/dev/sdX`;
+  it resolves via the stable `/dev/disk/by-uuid/<uuid>` symlink, and `discover` drops any stale pin.
+- **Spin-up self-heals stale state.** A dead dm-crypt mapping (backing device vanished / disk
+  re-enumerated → `device: (null)`) is detected and re-opened instead of mounting a corpse; a stale
+  removal record left by a since-migrated disk is discarded instead of chasing a rescan that hangs.
 
 ## [0.2.0] - 2026-07-01
 

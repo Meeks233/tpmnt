@@ -1,5 +1,10 @@
 name: Build & Publish
 
+# Dependency-based distribution: the release artifacts are proper .deb (apt) and
+# .rpm (dnf/zypper) packages that declare the runtime tools tpmnt orchestrates
+# (cryptsetup, systemd, hdparm, gnupg, …). No more standalone static binaries —
+# users install through their package manager so dependencies come along.
+#
 # Channels:
 #   * Every push to master/main  -> rolling PRE-RELEASE (tag `edge`).
 #   * A pushed version tag `v*`  -> stable RELEASE (that tag).
@@ -43,55 +48,10 @@ jobs:
             } >> "$GITHUB_OUTPUT"
           fi
 
-  # Cross-compiled binaries for the Linux arches users deploy to. The `-musl`
-  # targets are fully static (zero shared-library deps) — the primary artifact
-  # the README's install snippet pulls. Built on EVERY push (edge + releases).
-  binaries:
-    needs: channel
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: ${{ matrix.target }}
-      - uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2
-        with:
-          tool: cross
-      - name: Build
-        run: cross build --release --locked --target ${{ matrix.target }}
-      - name: Archive
-        env:
-          TARGET: ${{ matrix.target }}
-          REF_TAG: ${{ needs.channel.outputs.tag }}
-        run: |
-          stage="tpmnt-${REF_TAG}-${TARGET}"
-          mkdir "$stage"
-          cp "target/${TARGET}/release/tpmnt" "$stage/"
-          cp README.md LICENSE-MIT LICENSE-APACHE man/tpmnt.1 "$stage/"
-          tar czf "${stage}.tar.gz" "$stage"
-          sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: bin-${{ matrix.target }}
-          path: tpmnt-*.tar.gz*
-          if-no-files-found: error
-
-  # Debian packages — the apt/distro path. Only built for stable RELEASES (tags),
-  # not on every commit; edge pre-releases stay lean (static binaries only).
+  # Debian packages — the apt/distro path. Built for both edge pushes and stable
+  # tags. Cross-compiled for the two arches users deploy to.
   deb:
     needs: channel
-    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -122,6 +82,7 @@ jobs:
       - name: Build .deb
         env:
           TARGET: ${{ matrix.target }}
+        # man/tpmnt.1 is committed; cargo-deb builds the target binary itself.
         run: cargo deb --target "$TARGET" --output "tpmnt-${TARGET}.deb"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -129,10 +90,9 @@ jobs:
           path: tpmnt-*.deb
           if-no-files-found: error
 
-  # RPM packages — the dnf/zypper path. Stable RELEASES (tags) only, like .deb.
+  # RPM packages — the dnf/zypper path. Built for edge pushes and stable tags.
   rpm:
     needs: channel
-    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -160,11 +120,12 @@ jobs:
       - uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2
         with:
           tool: cargo-generate-rpm
-      - name: Build binary + .rpm
+      - name: Build binary + man + .rpm
         env:
           TARGET: ${{ matrix.target }}
         run: |
           cargo build --release --target "$TARGET"
+          "target/$TARGET/release/tpmnt" gen-man man/ || cargo run --release --target "$TARGET" -- gen-man man/
           # auto-req disabled: glibc is always present; we declare the tool deps ourselves.
           cargo generate-rpm --target "$TARGET" --auto-req disabled --output "tpmnt-${TARGET}.rpm"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -174,15 +135,18 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [channel, binaries, deb, rpm]
-    # `deb`/`rpm` are skipped on edge pushes; still publish if the binaries built.
-    if: ${{ always() && needs.binaries.result == 'success' }}
+    needs: [channel, deb, rpm]
+    if: ${{ always() && (needs.deb.result == 'success' || needs.rpm.result == 'success') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum tpmnt-* > SHA256SUMS
       - name: Publish to ${{ needs.channel.outputs.tag }}
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
