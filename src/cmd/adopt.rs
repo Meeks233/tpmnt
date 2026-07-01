@@ -249,13 +249,16 @@ fn adopt_on_device(
         );
     }
 
-    // 3. Enroll this host's TPM2 (runs locally; key stays local).
+    // 3. Enroll this host's TPM2 (runs locally; key stays local). Force is on:
+    //    taking ownership must REPLACE any TPM2 token the disk carried from a prior
+    //    owner/host. A relocated disk often has a stale `systemd-tpm2` token sealed
+    //    to a *foreign* TPM ("does not belong to this TPM"); without forcing, enroll
+    //    would short-circuit to a no-op and auto-unlock would fail on this host.
     let mut tpm_token = false;
     if !args.no_tpm && inspectable {
         let pcrs = super::enroll::parse_pcrs(args.pcrs.as_deref())?;
         let pass = new_pass.clone();
-        let enroll =
-            super::enroll::enroll_device(ctx, device, &pcrs, want_pin, false, || Ok(pass))?;
+        let enroll = super::enroll::enroll_device(ctx, device, &pcrs, want_pin, true, || Ok(pass))?;
         tpm_token = enroll
             .get("tpm2_token_present")
             .and_then(|v| v.as_bool())
@@ -478,7 +481,10 @@ fn register_new_disk(
     Ok(Disk {
         name: name.to_string(),
         uuid,
-        device: Some(device),
+        // A LOCAL disk resolves via the stable /dev/disk/by-uuid/<uuid> symlink, so
+        // it survives re-enumeration (sda↔sdb↔sdc). Only a REMOTE disk stores a
+        // device path — there it names the disk on the *remote* host.
+        device: if is_remote { Some(device) } else { None },
         mapper: None,
         mountpoint,
         fstype: args

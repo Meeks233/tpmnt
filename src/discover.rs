@@ -166,10 +166,12 @@ pub fn rebind(disk: &mut Disk, loc: &Location) -> bool {
             if disk.transport.take().is_some() {
                 changed = true;
             }
-            // Coming back from a remote leaves a stale remote device path behind;
-            // drop it so `device_path()` resolves via the stable by-uuid symlink.
-            if changed && disk.device.is_some() {
-                disk.device = None;
+            // A local disk always resolves via the stable /dev/disk/by-uuid/<uuid>
+            // symlink, which survives re-enumeration (sda↔sdb↔sdc) — so never keep a
+            // pinned /dev/sdX. Drop any stored device path (whether it's a stale
+            // remote path from coming home, or a fragile local node from adopt).
+            if disk.device.take().is_some() {
+                changed = true;
             }
             changed
         }
@@ -240,6 +242,23 @@ mod tests {
         assert!(d.device.is_none());
         assert_eq!(d.device_path(), "/dev/disk/by-uuid/u-123");
         assert!(d.decrypts_locally());
+    }
+
+    #[test]
+    fn rebind_local_disk_drops_pinned_device_for_by_uuid() {
+        // A local disk adopted with a fragile /dev/sda pin must be re-pointed at the
+        // stable by-uuid symlink so it survives re-enumeration.
+        let mut d = disk("arc");
+        d.device = Some("/dev/sda".into());
+        let changed = rebind(
+            &mut d,
+            &Location::Local {
+                device: "/dev/sdb".into(),
+            },
+        );
+        assert!(changed);
+        assert!(d.device.is_none());
+        assert_eq!(d.device_path(), "/dev/disk/by-uuid/u-123");
     }
 
     #[test]

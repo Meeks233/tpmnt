@@ -60,6 +60,42 @@ pub fn parse_pcrs(spec: Option<&str>) -> Result<Vec<u32>> {
         .collect()
 }
 
+/// Build the `systemd-cryptenroll` argv that enrolls a fresh TPM2 token. An empty
+/// `pcrs` binds to no PCRs explicitly (`--tpm2-pcrs=`, TPM-only).
+fn cryptenroll_argv(device: &str, pcrs: &[u32], with_pin: bool) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["systemd-cryptenroll".into()];
+    argv.push("--tpm2-device=auto".into());
+    if pcrs.is_empty() {
+        argv.push("--tpm2-pcrs=".into()); // explicit: bind to no PCRs
+    } else {
+        let joined = pcrs
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join("+");
+        argv.push(format!("--tpm2-pcrs={joined}"));
+    }
+    if with_pin {
+        argv.push("--tpm2-with-pin=yes".into());
+    }
+    argv.push(device.to_string());
+    argv
+}
+
+/// Build the `systemd-cryptenroll` argv that wipes any existing TPM2 slot. This is
+/// run as its OWN operation before a forced re-enroll: a combined
+/// `--wipe-slot=tpm2 --tpm2-device=auto` is NOT sufficient, because when a token
+/// already binds the *same* PCR set systemd-cryptenroll reports "already enrolled,
+/// executing no operation" and skips BOTH the wipe and the new enrollment —
+/// leaving a stale/foreign token (sealed to another TPM) that can't unlock here.
+fn cryptenroll_wipe_argv(device: &str) -> Vec<String> {
+    vec![
+        "systemd-cryptenroll".into(),
+        "--wipe-slot=tpm2".into(),
+        device.to_string(),
+    ]
+}
+
 /// Public entry. Returns a JSON result describing the enrollment.
 pub fn run(ctx: &Context, args: &EnrollArgs) -> Result<Value> {
     let pcrs = parse_pcrs(args.pcrs.as_deref())?;
@@ -139,28 +175,25 @@ pub fn enroll_device(
 
     // 7. Build and run systemd-cryptenroll.
     let pass = passphrase()?;
-    let mut argv: Vec<String> = vec!["systemd-cryptenroll".into()];
-    // Re-enrollment: drop the existing TPM2 slot first so the new (PIN / no-PIN)
-    // token replaces it rather than piling up a second one.
-    if force {
-        argv.push("--wipe-slot=tpm2".into());
-    }
-    argv.push("--tpm2-device=auto".into());
-    if !pcrs.is_empty() {
-        let joined = pcrs
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>()
-            .join("+");
-        argv.push(format!("--tpm2-pcrs={joined}"));
-    } else {
-        argv.push("--tpm2-pcrs=".into()); // explicit: bind to no PCRs
-    }
-    if with_pin {
-        argv.push("--tpm2-with-pin=yes".into());
-    }
-    argv.push(device.to_string());
 
+    // Forced re-enroll of a disk that ALREADY has a TPM2 token: wipe it first, as a
+    // separate operation. A combined `--wipe-slot=tpm2 --tpm2-device=auto` no-ops
+    // ("already enrolled") when the existing token binds the same PCR set, so a
+    // foreign token sealed to another TPM would survive and auto-unlock would fail
+    // here. Only wipe when a token actually exists (else there is nothing to wipe).
+    if force && info.has_tpm2_token() {
+        let wipe = cryptenroll_wipe_argv(device);
+        let wipe_ref: Vec<&str> = wipe.iter().map(|s| s.as_str()).collect();
+        ctx.runner
+            .run_env(
+                &wipe_ref,
+                &[("PASSWORD", pass.as_str())],
+                "wipe existing TPM2 slot before re-enroll",
+            )?
+            .require("systemd-cryptenroll --wipe-slot=tpm2")?;
+    }
+
+    let argv = cryptenroll_argv(device, pcrs, with_pin);
     let argv_ref: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
 
     let mut envs: Vec<(&str, &str)> = vec![("PASSWORD", pass.as_str())];
@@ -203,7 +236,42 @@ pub fn enroll_device(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_pcrs;
+    use super::{cryptenroll_argv, cryptenroll_wipe_argv, parse_pcrs};
+
+    #[test]
+    fn wipe_is_a_separate_operation_not_a_combined_flag() {
+        // Regression: a combined `--wipe-slot=tpm2 --tpm2-device=auto` no-ops when a
+        // token with the same PCR set exists, leaving a foreign token that can't
+        // unlock here. The wipe MUST be its own systemd-cryptenroll invocation, and
+        // the enroll argv must NOT carry --wipe-slot.
+        let wipe = cryptenroll_wipe_argv("/dev/sda");
+        assert_eq!(
+            wipe,
+            vec![
+                "systemd-cryptenroll".to_string(),
+                "--wipe-slot=tpm2".to_string(),
+                "/dev/sda".to_string(),
+            ]
+        );
+        // The wipe carries NO --tpm2-device, so it can never be short-circuited by
+        // the "already enrolled" check.
+        assert!(!wipe.iter().any(|a| a == "--tpm2-device=auto"));
+
+        let enroll = cryptenroll_argv("/dev/sda", &[], false);
+        assert!(!enroll.iter().any(|a| a == "--wipe-slot=tpm2"));
+        assert!(enroll.contains(&"--tpm2-device=auto".to_string()));
+    }
+
+    #[test]
+    fn pcrs_and_pin_render_expected_flags() {
+        let argv = cryptenroll_argv("/dev/sdb", &[7, 14], true);
+        assert!(argv.contains(&"--tpm2-pcrs=7+14".to_string()));
+        assert!(argv.contains(&"--tpm2-with-pin=yes".to_string()));
+        // Empty PCRs are explicit (TPM-only), never omitted.
+        let tpm_only = cryptenroll_argv("/dev/sdb", &[], false);
+        assert!(tpm_only.contains(&"--tpm2-pcrs=".to_string()));
+        assert!(!tpm_only.iter().any(|a| a == "--tpm2-with-pin=yes"));
+    }
 
     #[test]
     fn empty_and_none_mean_tpm_only() {
