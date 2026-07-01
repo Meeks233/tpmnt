@@ -346,12 +346,17 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
             ctx.config.defaults.mount_backend,
             dry,
         )?;
-        // Mount now (the mapper is already open).
+        // Mount now (the mapper is already open), with the SAME options reconcile
+        // wrote to fstab — so the live mount matches steady state (noatime for
+        // cold-standby, compress=zstd for btrfs) instead of bare defaults.
         if !r.no_format {
+            let opts = reconcile::mount_options(&disk);
             ctx.runner
                 .run(
                     &[
                         "mount",
+                        "-o",
+                        &opts,
                         &format!("/dev/mapper/{mapper}"),
                         &r.mountpoint.to_string_lossy(),
                     ],
