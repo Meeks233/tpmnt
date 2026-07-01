@@ -4,6 +4,24 @@ All notable changes to tpmnt are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **On-demand connect (`tpmnt connect [name…]`, alias `up`).** A pull-based bring-online: for each
+  disk it tries the **last-known endpoint** first (establish the ciphertext forward, open via TPM2,
+  mount) without probing anyone else. Only if that endpoint doesn't answer does it fall back to a
+  single global discovery sweep, rebind, and retry. Rejects only when the disk is reachable nowhere.
+
+### Changed
+
+- **Auto-discovery is now lazy and batched — no more per-remote flooding.** `discover` (and the
+  discovery baked into `apply`/`migrate`) no longer probes every remote for every disk. It
+  inventories this host once (`blkid -o export`), trusts a disk's last-known remote binding without
+  probing, and only when a disk expected *here* has genuinely vanished does it perform a **single
+  global sweep** (one `blkid` per remote, all UUIDs compared at once). Cost drops from `N × M` probes
+  to at most `1 + M` for N disks across M remotes.
+
 ## [0.2.0] - 2026-07-01
 
 ### Added

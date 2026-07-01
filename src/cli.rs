@@ -81,6 +81,11 @@ pub enum Command {
     /// (local↔remote or between remotes). Runs automatically inside `apply`.
     #[command(alias = "scan", alias = "locate")]
     Discover(DiscoverArgs),
+    /// Pull disk(s) online on demand: try each at its last-known endpoint first,
+    /// and only fall back to a single global discovery sweep if that endpoint
+    /// doesn't answer (never a per-remote storm). Default: all disks, or name some.
+    #[command(alias = "up")]
+    Connect(ConnectArgs),
     /// Report per-disk LUKS2/token/crypttab/mount state.
     Status,
     /// Fancy, TUI-style dashboard of every disk's tpmnt-managed state.
@@ -387,6 +392,17 @@ pub struct RecoverArgs {
 pub struct DiscoverArgs {
     /// Disks to re-locate (default: all configured disks).
     pub names: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ConnectArgs {
+    /// Disks to bring online (default: every configured disk).
+    pub names: Vec<String>,
+
+    /// Base local port for the NBD-over-SSH ciphertext forward. Each remote disk
+    /// connected in one run uses a distinct port counting up from this.
+    #[arg(long, default_value_t = 21815)]
+    pub local_port: u16,
 }
 
 #[derive(Args, Debug)]

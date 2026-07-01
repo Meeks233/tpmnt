@@ -865,10 +865,12 @@ fn spindown_impl(
 /// find the already-attached nbd device whose LUKS header UUID matches. This is
 /// the spin-up counterpart to spindown's remote `hdparm` power-off: teardown
 /// leaves the forward live, so spin-up just re-opens the forwarded ciphertext.
-fn local_container(ctx: &Context, disk: &Disk) -> Result<String> {
-    if ctx.config.ssh_prefix_for(disk).is_empty() {
-        return Ok(disk.device_path());
-    }
+/// Scan the attached NBD devices for the one whose LUKS header UUID is `uuid` —
+/// i.e. the `/dev/nbdN` currently forwarding this disk's ciphertext here. `None`
+/// when no live forward carries it (not attached, or attached elsewhere). Used
+/// both to open a forwarded disk and to decide whether `connect` must (re)build
+/// the forward.
+pub fn forwarded_local_device(ctx: &Context, uuid: &str) -> Option<String> {
     for n in 0..16 {
         // Only attached nbd devices report a non-zero size; skip the rest cheaply.
         match std::fs::read_to_string(format!("/sys/block/nbd{n}/size")) {
@@ -880,10 +882,20 @@ fn local_container(ctx: &Context, disk: &Disk) -> Result<String> {
             &["cryptsetup", "luksUUID", &dev],
             "identify forwarded NBD device by LUKS UUID",
         ) {
-            if out.ok() && out.stdout.trim() == disk.uuid {
-                return Ok(dev);
+            if out.ok() && out.stdout.trim() == uuid {
+                return Some(dev);
             }
         }
+    }
+    None
+}
+
+fn local_container(ctx: &Context, disk: &Disk) -> Result<String> {
+    if ctx.config.ssh_prefix_for(disk).is_empty() {
+        return Ok(disk.device_path());
+    }
+    if let Some(dev) = forwarded_local_device(ctx, &disk.uuid) {
+        return Ok(dev);
     }
     // Under --plan/--dry-run the forward may legitimately be absent; fall back to
     // the config path so the plan still renders instead of hard-failing.

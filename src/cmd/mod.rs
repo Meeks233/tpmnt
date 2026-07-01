@@ -4,6 +4,7 @@
 
 pub mod adopt;
 pub mod apply;
+pub mod connect;
 pub mod destroy;
 pub mod discover;
 pub mod enroll;

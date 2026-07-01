@@ -21,6 +21,8 @@
 //! reflects reality for planning. Nothing here mounts or decrypts; it only tells
 //! the caller where the disk is and how the config should point at it.
 
+use std::collections::HashMap;
+
 use serde::Serialize;
 
 use crate::config::{Disk, Remote, Transport};
@@ -45,59 +47,109 @@ impl Location {
     }
 }
 
-/// Locate a disk by its LUKS UUID: probe this host first (a locally-attached disk
-/// is always preferred — decryption is cheapest and safest here), then each known
-/// remote over SSH. The first hit wins. Read-only; safe under dry-run.
-pub fn locate(runner: &Runner, remotes: &[Remote], disk: &Disk) -> Location {
-    if disk.uuid.trim().is_empty() {
-        return Location::Absent;
+/// A per-host map of `LUKS UUID → device path`, built with a *single* `blkid`
+/// call per host rather than one lookup per (disk, host). This is the whole point
+/// of the batched design: N disks across M remotes cost at most `1 + M` probes,
+/// not `N × M`, so a "where did my disk go?" scan never fans out into a storm of
+/// SSH round-trips that hammers every server.
+pub type Uuids = HashMap<String, String>;
+
+/// Inventory this host's block devices once: `blkid -o export` lists every device
+/// with its UUID, which for a LUKS2 container is the container's own UUID. Empty
+/// on any failure (treated as "nothing here" — the caller falls back to other
+/// locations). Read-only; safe under dry-run.
+pub fn local_inventory(runner: &Runner) -> Uuids {
+    match runner.probe(&["blkid", "-o", "export"], "inventory local block UUIDs") {
+        Ok(out) if out.ok() => parse_blkid_export(&out.stdout),
+        _ => Uuids::new(),
     }
-    if let Some(device) = blkid_local(runner, &disk.uuid) {
-        return Location::Local { device };
-    }
-    for r in remotes {
-        if let Some(device) = blkid_remote(runner, r, &disk.uuid) {
-            return Location::Remote {
-                remote: r.name.clone(),
-                device,
+}
+
+/// The single global remote sweep: inventory *every* known remote exactly once
+/// (`sudo -n blkid -o export`, mirroring the qemu-nbd ciphertext export's need for
+/// privilege). Returned in config order so the first remote that carries a UUID
+/// wins, matching the "prefer where it was first found" intent. An unreachable
+/// remote contributes an empty map instead of aborting the sweep.
+pub fn remote_inventory(runner: &Runner, remotes: &[Remote]) -> Vec<(String, Uuids)> {
+    remotes
+        .iter()
+        .map(|r| {
+            let prefix = r.ssh_prefix();
+            let uuids = match runner.probe_on(
+                &prefix,
+                &["sudo", "-n", "blkid", "-o", "export"],
+                "inventory remote block UUIDs",
+            ) {
+                Ok(out) if out.ok() => parse_blkid_export(&out.stdout),
+                _ => Uuids::new(),
             };
+            (r.name.clone(), uuids)
+        })
+        .collect()
+}
+
+/// Parse `blkid -o export` output into a `UUID → DEVNAME` map. Records are blank-
+/// line separated blocks of `KEY=VALUE` lines; we key on the LUKS container's
+/// `UUID` (never `PARTUUID`/`UUID_SUB`, which have distinct key names).
+fn parse_blkid_export(stdout: &str) -> Uuids {
+    let mut map = Uuids::new();
+    let mut devname: Option<String> = None;
+    let mut uuid: Option<String> = None;
+    let flush = |dev: &mut Option<String>, id: &mut Option<String>, map: &mut Uuids| {
+        if let (Some(d), Some(u)) = (dev.take(), id.take()) {
+            map.insert(u, d);
+        }
+    };
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            flush(&mut devname, &mut uuid, &mut map);
+        } else if let Some(v) = line.strip_prefix("DEVNAME=") {
+            devname = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("UUID=") {
+            uuid = Some(v.to_string());
         }
     }
-    Location::Absent
+    flush(&mut devname, &mut uuid, &mut map); // final record has no trailing blank
+    map
 }
 
-/// Resolve a UUID to a local device path via `blkid -U`. blkid reports a LUKS2
-/// container's own UUID, so this finds the ciphertext device directly. `None`
-/// when the UUID is not present locally.
-fn blkid_local(runner: &Runner, uuid: &str) -> Option<String> {
-    let out = runner
-        .probe(&["blkid", "-U", uuid], "locate disk by LUKS UUID (local)")
-        .ok()?;
-    let dev = out.stdout.trim();
-    if out.ok() && !dev.is_empty() {
-        Some(dev.to_string())
-    } else {
-        None
+/// Decide where `disk` lives from an already-collected inventory — no I/O, so it
+/// never adds a round-trip. Local always wins (decryption is cheapest here). When
+/// a `remote_inv` sweep was performed it is authoritative (a UUID absent from it
+/// is genuinely gone → `Absent`); when it was *not* performed we deliberately
+/// trust the disk's last-known remote binding instead of probing every server —
+/// the "don't proactively monitor all remotes" rule.
+pub fn resolve(local: &Uuids, remote_inv: Option<&[(String, Uuids)]>, disk: &Disk) -> Location {
+    let uuid = disk.uuid.trim();
+    if uuid.is_empty() {
+        return Location::Absent;
     }
-}
-
-/// Resolve a UUID to a device path on `remote` over SSH. Reading a root-owned
-/// block device needs privilege, so blkid runs under `sudo -n` (mirroring the
-/// qemu-nbd ciphertext export). `None` when unreachable or the UUID isn't there.
-fn blkid_remote(runner: &Runner, remote: &Remote, uuid: &str) -> Option<String> {
-    let prefix = remote.ssh_prefix();
-    let out = runner
-        .probe_on(
-            &prefix,
-            &["sudo", "-n", "blkid", "-U", uuid],
-            "locate disk by LUKS UUID (remote)",
-        )
-        .ok()?;
-    let dev = out.stdout.trim();
-    if out.ok() && !dev.is_empty() {
-        Some(dev.to_string())
-    } else {
-        None
+    if let Some(device) = local.get(uuid) {
+        return Location::Local {
+            device: device.clone(),
+        };
+    }
+    match remote_inv {
+        Some(inv) => {
+            for (name, uuids) in inv {
+                if let Some(device) = uuids.get(uuid) {
+                    return Location::Remote {
+                        remote: name.clone(),
+                        device: device.clone(),
+                    };
+                }
+            }
+            Location::Absent
+        }
+        // No sweep: trust the last-known remote binding rather than fanning out.
+        None => match (disk.remote.as_deref(), disk.device.as_deref()) {
+            (Some(remote), Some(device)) => Location::Remote {
+                remote: remote.to_string(),
+                device: device.to_string(),
+            },
+            _ => Location::Absent,
+        },
     }
 }
 
@@ -248,5 +300,76 @@ mod tests {
         assert!(!rebind(&mut d, &Location::Absent));
         assert_eq!(d.remote.as_deref(), Some("nas"));
         assert_eq!(d.device.as_deref(), Some("/dev/sda"));
+    }
+
+    #[test]
+    fn parse_blkid_export_keys_on_luks_uuid_only() {
+        // Two records, one trailing (no final blank line); a PARTUUID must not be
+        // mistaken for the container UUID.
+        let out = "DEVNAME=/dev/sda1\nUUID=u-123\nTYPE=crypto_LUKS\nPARTUUID=p-999\n\n\
+                   DEVNAME=/dev/sdb\nUUID=u-456\nTYPE=crypto_LUKS\n";
+        let map = parse_blkid_export(out);
+        assert_eq!(map.get("u-123").map(String::as_str), Some("/dev/sda1"));
+        assert_eq!(map.get("u-456").map(String::as_str), Some("/dev/sdb"));
+        assert!(!map.contains_key("p-999"));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn resolve_prefers_local_over_remote() {
+        let d = disk("arc"); // uuid u-123
+        let mut local = Uuids::new();
+        local.insert("u-123".into(), "/dev/sdb1".into());
+        let mut r = Uuids::new();
+        r.insert("u-123".into(), "/dev/sda".into());
+        let inv = vec![("nas".into(), r)];
+        assert_eq!(
+            resolve(&local, Some(&inv), &d),
+            Location::Local {
+                device: "/dev/sdb1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_without_sweep_trusts_last_known_remote() {
+        let mut d = disk("arc");
+        d.remote = Some("nas".into());
+        d.device = Some("/dev/sda".into());
+        // Not present locally, no remote sweep performed -> assume last-known spot.
+        assert_eq!(
+            resolve(&Uuids::new(), None, &d),
+            Location::Remote {
+                remote: "nas".into(),
+                device: "/dev/sda".into()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_sweep_is_authoritative_and_can_report_absent() {
+        let mut d = disk("arc");
+        d.remote = Some("nas".into());
+        d.device = Some("/dev/sda".into());
+        // A sweep ran and the UUID is nowhere -> genuinely gone, despite a binding.
+        let inv: Vec<(String, Uuids)> = vec![("nas".into(), Uuids::new())];
+        assert_eq!(resolve(&Uuids::new(), Some(&inv), &d), Location::Absent);
+    }
+
+    #[test]
+    fn resolve_sweep_finds_disk_moved_to_another_remote() {
+        let mut d = disk("arc");
+        d.remote = Some("nas".into());
+        d.device = Some("/dev/sda".into());
+        let mut shed = Uuids::new();
+        shed.insert("u-123".into(), "/dev/sdc".into());
+        let inv = vec![("nas".into(), Uuids::new()), ("shed".into(), shed)];
+        assert_eq!(
+            resolve(&Uuids::new(), Some(&inv), &d),
+            Location::Remote {
+                remote: "shed".into(),
+                device: "/dev/sdc".into()
+            }
+        );
     }
 }

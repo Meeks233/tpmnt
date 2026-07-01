@@ -416,8 +416,7 @@ transport = "nbd"     # forward ciphertext here, decrypt locally → managed
 A disk is identified by its stable **LUKS2 UUID**, never by a device path or a host — because both
 change when you physically move it. Pull an archive drive out of the NAS and plug it into your
 laptop, or shuttle it from one remote to another: **you don't have to reconfigure anything**.
-`tpmnt discover` probes every candidate location for the disk's UUID (locally via `blkid`, then each
-`[[remote]]` over SSH) and rebinds the config to wherever it actually is — always keeping decryption
+`tpmnt discover` rebinds the config to wherever a disk's UUID actually is — always keeping decryption
 on **this** trusted host:
 
 - found **locally** → `remote`/`transport` cleared, resolved via the stable `/dev/disk/by-uuid/…`;
@@ -430,9 +429,17 @@ tpmnt discover archive      # just one; aliases: `scan`, `locate`
 tpmnt discover --plan       # probe read-only, show where each disk is, change nothing
 ```
 
-Discovery runs **automatically at the start of `apply`**, so ordinary use never has to think about
-it — the whole point is that you don't know or care where a disk currently sits (only the dashboard
-surfaces it). A disk that isn't found anywhere is left untouched (it's just unplugged).
+**Lazy, batched probing — no server flooding.** Discovery does **not** proactively poll every remote.
+It inventories **this** host once (a single `blkid`), and a disk pinned to a remote keeps its
+last-known binding untrusted-but-unprobed. Only when a disk we expected *here* has genuinely vanished
+does it fall back to a **single global sweep** — exactly one `blkid` per remote, all UUIDs compared at
+once — instead of one lookup per (disk, remote). N disks across M remotes therefore cost at most
+`1 + M` probes, never `N × M`.
+
+Bringing a disk online is a **pull**, not a background watcher: `tpmnt connect [name…]` (alias `up`)
+tries each disk at its last-known endpoint first, and only if that endpoint doesn't answer triggers
+the one global sweep to find where it moved, then opens + mounts it here. A disk that isn't found
+anywhere is left untouched (it's just unplugged); `connect` rejects only when it's reachable nowhere.
 
 ## Power profiles: cold-standby auto power-off (Phase D)
 
@@ -558,6 +565,7 @@ sudo tpmnt apply --plan
 | `tpmnt destroy <name>` | Permanently drop a disk's local management (config, crypttab/fstab, units, key bundles, header backup). Requires `--yes` (even for AI). **Does not format** — the LUKS ciphertext is left intact; reformat later if you need the space. |
 | `tpmnt enroll <device>` | Back up the LUKS2 header, then enroll a TPM2 token via `systemd-cryptenroll`. Refuses TPM-only setups that have no passphrase fallback. |
 | `tpmnt apply` | Idempotently reconcile crypttab + the mount backend (fstab or systemd `.mount`) to the TOML. |
+| `tpmnt connect [name…]` | Pull disk(s) online **on demand** (alias `up`): try each at its last-known endpoint first (forward + open + mount), and only if that endpoint doesn't answer fall back to a **single global discovery sweep** (one `blkid` per remote, compared at once — never a per-remote storm), rebind, and retry. Rejects only if the disk is nowhere reachable. |
 | `tpmnt status` | Per disk: LUKS2? TPM2 token? crypttab entry? mounted? Plus environment detection. |
 | `tpmnt dashboard` | Fancy, TUI-style panels of every disk's tpmnt-managed state (encryption posture, fallback-key lockout risk, mount, cold-standby power). Same JSON as `status` under `--json`. |
 | `tpmnt migrate` | On a new machine: re-enroll the **local** TPM for each disk, then rebuild crypttab/fstab. With a PIN vault present, **one PIN unlocks every disk** (`--pin-file`); otherwise each falls back to its portable passphrase via `$PASSWORD`. |

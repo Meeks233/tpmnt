@@ -24,20 +24,60 @@ use super::Context;
 /// Shared with `apply`, which calls this first so a moved disk is transparently
 /// re-pointed before crypttab/fstab/units are reconciled.
 pub fn relocate(ctx: &Context, names: Option<&[String]>) -> Result<(Config, Vec<Value>)> {
+    relocate_inner(ctx, names, false)
+}
+
+/// Like `relocate`, but *forces* the single global remote sweep even when no disk
+/// looks locally-missing. `connect` uses this on retry: a disk pinned to a remote
+/// that just failed to answer at its last-known endpoint needs the sweep to find
+/// where it actually moved (the "missing → ask everyone once" path).
+pub fn relocate_sweep(ctx: &Context, names: Option<&[String]>) -> Result<(Config, Vec<Value>)> {
+    relocate_inner(ctx, names, true)
+}
+
+/// Locate + rebind using the batched inventory. One `blkid` inventories this host;
+/// the network is touched only when it must be — either a disk we expected here
+/// has vanished, or `force_sweep` is set — and then as a *single* sweep (one probe
+/// per remote), never per-disk-per-remote. When no sweep runs, disks pinned to a
+/// remote keep their last-known binding untouched ("don't monitor all remotes").
+fn relocate_inner(
+    ctx: &Context,
+    names: Option<&[String]>,
+    force_sweep: bool,
+) -> Result<(Config, Vec<Value>)> {
     let dry = ctx.global.effective_dry_run();
     let remotes = ctx.config.remotes.clone();
     let mut cfg = ctx.config.clone();
+
+    let selected = |disk: &crate::config::Disk| -> bool {
+        names.is_none_or(|f| f.iter().any(|n| n == &disk.name))
+    };
+
+    // One local probe covers the common case (a disk sits where the config says).
+    let local = discover::local_inventory(&ctx.runner);
+
+    // Only a disk we expected *here* but that isn't present, and that isn't pinned
+    // to a remote, justifies touching the network — that's a genuine "missing".
+    let has_missing = cfg.disks.iter().any(|d| {
+        selected(d)
+            && !d.uuid.trim().is_empty()
+            && !local.contains_key(d.uuid.trim())
+            && d.remote.is_none()
+    });
+    let remote_inv = if force_sweep || has_missing {
+        Some(discover::remote_inventory(&ctx.runner, &remotes))
+    } else {
+        None
+    };
+
     let mut report = Vec::new();
     let mut dirty = false;
-
     for disk in cfg.disks.iter_mut() {
-        if let Some(filter) = names {
-            if !filter.iter().any(|n| n == &disk.name) {
-                continue;
-            }
+        if !selected(disk) {
+            continue;
         }
         let from = binding_of(disk);
-        let loc = discover::locate(&ctx.runner, &remotes, disk);
+        let loc = discover::resolve(&local, remote_inv.as_deref(), disk);
         let moved = discover::rebind(disk, &loc);
         if moved {
             dirty = true;

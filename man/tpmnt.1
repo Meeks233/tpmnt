@@ -67,6 +67,9 @@ Idempotently reconcile the system (crypttab/fstab/units) to the config
 tpmnt\-discover(1)
 Re\-locate each disk by its LUKS UUID and rebind the config if it moved (local↔remote or between remotes). Runs automatically inside `apply`
 .TP
+tpmnt\-connect(1)
+Pull disk(s) online on demand: try each at its last\-known endpoint first, and only fall back to a single global discovery sweep if that endpoint doesn\*(Aqt answer (never a per\-remote storm). Default: all disks, or name some
+.TP
 tpmnt\-status(1)
 Report per\-disk LUKS2/token/crypttab/mount state
 .TP
