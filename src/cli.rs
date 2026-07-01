@@ -200,9 +200,15 @@ pub struct InitArgs {
     /// Usage scenario: "cold-standby" (default, auto power-off) or "always-on".
     #[arg(long)]
     pub power_profile: Option<String>,
-    /// Idle window before a cold-standby disk powers off (e.g. "5min", "30s").
+    /// Idle window before a cold-standby disk's platters spin down to standby
+    /// (mapping kept open; wakes on next access). Default "5min". The old
+    /// `--idle-timeout` name is accepted as an alias.
+    #[arg(long, alias = "idle-timeout")]
+    pub standby_timeout: Option<String>,
+    /// Idle window before a cold-standby disk is fully powered off (unmount +
+    /// close + power down). Default "30min"; must exceed --standby-timeout.
     #[arg(long)]
-    pub idle_timeout: Option<String>,
+    pub poweroff_timeout: Option<String>,
     /// Power-down method: "auto" (default), "standby", "sleep", "power-off", or
     /// "remove" (remove the disk from its host OS; reversible on next spin-up).
     #[arg(long)]
@@ -408,8 +414,23 @@ pub struct MountRemoteArgs {
 
 #[derive(Args, Debug)]
 pub struct PowerArgs {
-    /// Name of the [[disk]] to spin down.
-    pub name: String,
+    /// Name of the [[disk]] to spin down now — or to configure when a timeout
+    /// flag is given. Optional only with --global.
+    pub name: Option<String>,
+
+    /// Set the cold-standby standby window (idle time before the platters spin
+    /// down, mapping kept). Writes config instead of spinning down now. Applies to
+    /// the named disk, or to the global [defaults] with --global.
+    #[arg(long)]
+    pub standby_timeout: Option<String>,
+    /// Set the cold-standby power-off window (idle time before full teardown +
+    /// power off). Writes config instead of spinning down now.
+    #[arg(long)]
+    pub poweroff_timeout: Option<String>,
+    /// Apply --standby-timeout/--poweroff-timeout to the global [defaults] rather
+    /// than a single disk.
+    #[arg(long)]
+    pub global: bool,
 }
 
 #[derive(Args, Debug)]

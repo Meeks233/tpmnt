@@ -28,6 +28,11 @@ struct MonitorState {
     counter: u64,
     /// Epoch seconds when `counter` last changed (i.e. last real access).
     last_change: u64,
+    /// True once the platters have been parked at the standby stage (mapping still
+    /// open). Cleared on the next real access. Prevents re-issuing `hdparm -y`
+    /// every tick while idle between the standby and power-off windows.
+    #[serde(default)]
+    standby: bool,
 }
 
 fn now_epoch() -> u64 {
@@ -214,6 +219,40 @@ fn tune_spindown_authority(ctx: &Context, disk: &Disk) -> Value {
         }
         Err(e) => {
             json!({"step": "tune-power", "device": phys, "skipped": "hdparm unavailable", "error": e.message})
+        }
+    }
+}
+
+/// Stage 1 of cold-standby idle handling: spin the platters down to standby but
+/// leave the LUKS mapping + mount in place, so the next real access transparently
+/// wakes the drive. Uses `hdparm -y` (STANDBY IMMEDIATE, auto-wakes on I/O) and
+/// only for fixed rotational disks — SSD/loop have no platters, and removable/USB
+/// disks wait for the full power-off stage instead. Best-effort: an unsupported
+/// drive/bridge fails harmlessly (recorded, never fatal). Acts on the disk's host.
+fn enter_standby(ctx: &Context, disk: &Disk) -> Value {
+    let (phys, prefix) = phys_and_prefix(ctx, disk);
+    let dry = ctx.global.effective_dry_run();
+    // Same predicate as APM tuning: only fixed rotational disks have platters to
+    // park; SSD/loop and removable/USB disks wait for the power-off stage.
+    if !dry
+        && !should_tune_apm(
+            is_rotational(ctx, &prefix, &phys),
+            is_removable(ctx, &prefix, &phys),
+        )
+    {
+        return json!({"step": "standby", "device": phys, "skipped": "not a fixed rotational disk"});
+    }
+    match ctx.runner.run_on(
+        &prefix,
+        &priv_argv(&prefix, &["hdparm", "-y", &phys]),
+        "spin platters down to standby (mapping kept open; wakes on next access)",
+    ) {
+        Ok(out) if out.ok() => json!({"step": "standby", "device": phys, "method": "hdparm -y"}),
+        Ok(out) => {
+            json!({"step": "standby", "device": phys, "skipped": "standby unsupported", "stderr": out.stderr.trim()})
+        }
+        Err(e) => {
+            json!({"step": "standby", "device": phys, "skipped": "hdparm unavailable", "error": e.message})
         }
     }
 }
@@ -831,7 +870,8 @@ pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
         }));
     }
 
-    let timeout = disk.idle_timeout_secs();
+    let standby_to = disk.standby_timeout_secs(&ctx.config.defaults);
+    let poweroff_to = disk.poweroff_timeout_secs(&ctx.config.defaults);
     let counter = mapper_stat_path(&mapper).and_then(|p| read_io_counter(&p));
     let counter = match counter {
         Some(c) => c,
@@ -855,11 +895,13 @@ pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
 
     if activity {
         if !ctx.global.effective_dry_run() {
+            // Real access wakes any parked platters: clear the standby flag.
             save_state(
                 &state_path,
                 &MonitorState {
                     counter,
                     last_change: now,
+                    standby: false,
                 },
             );
         }
@@ -868,24 +910,56 @@ pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
         let tune = first_obs.then(|| tune_spindown_authority(ctx, disk));
         return Ok(json!({
             "ok": true, "action": "keep", "name": disk.name,
-            "io_counter": counter, "idle_secs": 0, "idle_timeout_secs": timeout,
+            "io_counter": counter, "idle_secs": 0,
+            "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
             "reason": "real access detected", "tune": tune,
         }));
     }
 
-    if idle_secs >= timeout {
-        let sd = spindown(ctx, disk)?;
+    // Stage 2: fully idle past the power-off window -> unmount + close + power off.
+    if idle_secs >= poweroff_to {
+        let sd = spindown(ctx, disk)?; // resets/removes monitor state on success
         return Ok(json!({
             "ok": true, "action": "power-off", "name": disk.name,
-            "io_counter": counter, "idle_secs": idle_secs, "idle_timeout_secs": timeout,
+            "io_counter": counter, "idle_secs": idle_secs,
+            "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
             "spindown": sd,
+        }));
+    }
+
+    // Stage 1: idle past the standby window -> park the platters, keep the mapping
+    // open (transparent wake on next access). Issued once per idle stretch.
+    if idle_secs >= standby_to {
+        let already = prev.as_ref().map(|s| s.standby).unwrap_or(false);
+        if already {
+            return Ok(json!({
+                "ok": true, "action": "keep", "name": disk.name,
+                "io_counter": counter, "idle_secs": idle_secs,
+                "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
+                "reason": "in standby; awaiting power-off window",
+            }));
+        }
+        let standby = enter_standby(ctx, disk);
+        if !ctx.global.effective_dry_run() {
+            // Preserve last_change (idle keeps counting toward power-off); mark parked.
+            if let Some(mut s) = prev {
+                s.standby = true;
+                save_state(&state_path, &s);
+            }
+        }
+        return Ok(json!({
+            "ok": true, "action": "standby", "name": disk.name,
+            "io_counter": counter, "idle_secs": idle_secs,
+            "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
+            "standby": standby,
         }));
     }
 
     Ok(json!({
         "ok": true, "action": "keep", "name": disk.name,
-        "io_counter": counter, "idle_secs": idle_secs, "idle_timeout_secs": timeout,
-        "reason": "idle but within window",
+        "io_counter": counter, "idle_secs": idle_secs,
+        "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
+        "reason": "idle but within standby window",
     }))
 }
 
