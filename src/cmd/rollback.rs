@@ -33,6 +33,12 @@ pub fn run(ctx: &Context, args: &RollbackArgs) -> Result<Value> {
         .with_hint("rollback can only restore headers tpmnt previously backed up"));
     }
 
+    // Safety: back up the CURRENT on-disk header before restoring over it, so the
+    // rollback itself is reversible (restore the wrong backup? the live header is
+    // saved at <backup>.pre-restore). Overwrites any prior pre-restore snapshot.
+    let pre_restore = std::path::PathBuf::from(format!("{}.pre-restore", backup.display()));
+    luks::header_backup_force(&ctx.runner, &args.device, &pre_restore)?;
+
     // Restore the header.
     ctx.runner
         .run(
@@ -62,6 +68,7 @@ pub fn run(ctx: &Context, args: &RollbackArgs) -> Result<Value> {
         "device": args.device,
         "uuid": uuid,
         "header_restored_from": backup.display().to_string(),
+        "prior_header_saved_to": pre_restore.display().to_string(),
         "reverted": reverted,
     }))
 }

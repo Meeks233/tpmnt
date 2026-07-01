@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use crate::blockdev;
 use crate::config::{Disk, PowerOffMethod, Teardown};
 use crate::error::{Code, Error, Result};
+use crate::exec::Runner;
 use crate::reconcile::{unit_name_for, FileChange};
 
 use crate::cmd::Context;
@@ -1472,6 +1473,33 @@ pub fn schedule_tick(ctx: &Context, disk: &Disk, tz_override: Option<&str>) -> R
     }
 }
 
+/// Enable and (re)start a generated unit so it actually RUNS — writing the
+/// `.service` file alone leaves the daemon inert (the disk keeps spinning because
+/// nothing ever checks for idle). `restart` starts a stopped unit and reloads a
+/// changed file, covering both first-create and update. Traced+skipped under
+/// dry-run like any other mutation.
+fn enable_unit_now(runner: &Runner, unit: &str) -> Result<()> {
+    runner
+        .run(&["systemctl", "daemon-reload"], "reload systemd unit files")?
+        .require("systemctl daemon-reload")?;
+    runner
+        .run(&["systemctl", "enable", unit], "enable unit at boot")?
+        .require("systemctl enable")?;
+    runner
+        .run(&["systemctl", "restart", unit], "start/refresh unit now")?
+        .require("systemctl restart")?;
+    Ok(())
+}
+
+/// Stop + disable a unit before its file is removed. Best-effort: a unit that was
+/// never loaded must not fail the reconcile.
+fn disable_unit_now(runner: &Runner, unit: &str) {
+    let _ = runner.run(
+        &["systemctl", "disable", "--now", unit],
+        "stop + disable unit",
+    );
+}
+
 /// Reconcile the systemd scheduler unit for a disk: write it when a schedule is
 /// configured, remove it otherwise. Mirrors `reconcile_monitor_unit`.
 pub fn reconcile_schedule_unit(
@@ -1486,7 +1514,11 @@ pub fn reconcile_schedule_unit(
     if disk.schedule.is_none() {
         let action = if path.exists() {
             if !dry {
+                disable_unit_now(&ctx.runner, &unit_name);
                 let _ = std::fs::remove_file(&path);
+                let _ = ctx
+                    .runner
+                    .run(&["systemctl", "daemon-reload"], "reload systemd unit files");
             }
             "remove"
         } else {
@@ -1522,6 +1554,7 @@ pub fn reconcile_schedule_unit(
             .map_err(|e| Error::new(Code::EInternal, format!("mkdir unit dir: {e}")))?;
         std::fs::write(&path, &content)
             .map_err(|e| Error::new(Code::EInternal, format!("write schedule unit: {e}")))?;
+        enable_unit_now(&ctx.runner, &unit_name)?;
     }
     Ok(FileChange {
         path: path.display().to_string(),
@@ -1542,10 +1575,14 @@ pub fn reconcile_monitor_unit(
     let path = unit_dir.join(&unit_name);
 
     if !disk.is_cold_standby() {
-        // Ensure removed (idempotent).
+        // Ensure removed (idempotent): stop+disable the running daemon first.
         let action = if path.exists() {
             if !dry {
+                disable_unit_now(&ctx.runner, &unit_name);
                 let _ = std::fs::remove_file(&path);
+                let _ = ctx
+                    .runner
+                    .run(&["systemctl", "daemon-reload"], "reload systemd unit files");
             }
             "remove"
         } else {
@@ -1581,6 +1618,7 @@ pub fn reconcile_monitor_unit(
             .map_err(|e| Error::new(Code::EInternal, format!("mkdir unit dir: {e}")))?;
         std::fs::write(&path, &content)
             .map_err(|e| Error::new(Code::EInternal, format!("write monitor unit: {e}")))?;
+        enable_unit_now(&ctx.runner, &unit_name)?;
     }
     Ok(FileChange {
         path: path.display().to_string(),
@@ -1592,6 +1630,24 @@ pub fn reconcile_monitor_unit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enabling_a_unit_reloads_enables_and_starts_it() {
+        // Writing the .service file is not enough — the daemon must be enabled and
+        // started or the disk never spins down. Assert all three commands are issued.
+        let r = Runner::new(true, false);
+        enable_unit_now(&r, "tpmnt-monitor-arc.service").unwrap();
+        let cmds: Vec<Vec<String>> = r.trace.borrow().iter().map(|s| s.argv.clone()).collect();
+        assert_eq!(cmds[0], vec!["systemctl", "daemon-reload"]);
+        assert_eq!(
+            cmds[1],
+            vec!["systemctl", "enable", "tpmnt-monitor-arc.service"]
+        );
+        assert_eq!(
+            cmds[2],
+            vec!["systemctl", "restart", "tpmnt-monitor-arc.service"]
+        );
+    }
 
     #[test]
     fn dead_mapping_detected_from_null_backing_device() {

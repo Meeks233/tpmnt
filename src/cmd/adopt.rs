@@ -183,6 +183,20 @@ fn adopt_on_device(
     if inspectable {
         let info = luks::inspect(&ctx.runner, device)?;
         luks::require_luks2(&info, device)?;
+
+        // Persistently snapshot the ORIGINAL (pre-management) header BEFORE touching
+        // any keyslot, keyed by LUKS UUID under the backup dir — kept indefinitely so
+        // `tpmnt rollback <device>` can always restore the disk's prior owner state.
+        // On a re-adopt of the same UUID we refresh it, but first move the existing
+        // backup aside to `<file>.prev` so a capture is never silently lost.
+        if let Some(uuid) = info.uuid.as_deref() {
+            let dest = ctx.paths.header_backup(uuid);
+            if dest.exists() {
+                let prev = std::path::PathBuf::from(format!("{}.prev", dest.display()));
+                let _ = std::fs::rename(&dest, &prev);
+            }
+            luks::header_backup_force(&ctx.runner, device, &dest)?;
+        }
     } else if !dry {
         return Err(
             Error::new(Code::ENoDevice, format!("device not present: {device}"))

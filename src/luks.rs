@@ -196,6 +196,36 @@ pub fn header_backup(runner: &Runner, device: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Back up the header to `dest`, OVERWRITING any existing file (unlike
+/// `header_backup`, which preserves the first). `cryptsetup luksHeaderBackup`
+/// refuses to overwrite, so a stale `dest` is removed first. Used where a *fresh*
+/// capture is the point: `adopt` snapshotting the pristine pre-management header,
+/// and `rollback` saving the live header before it restores over it (so the
+/// restore is itself reversible). The file removal is skipped under dry-run.
+pub fn header_backup_force(runner: &Runner, device: &str, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::new(Code::EInternal, format!("mkdir {}: {e}", parent.display())))?;
+    }
+    if !runner.dry_run && dest.exists() {
+        std::fs::remove_file(dest)
+            .map_err(|e| Error::new(Code::EInternal, format!("rm {}: {e}", dest.display())))?;
+    }
+    runner
+        .run(
+            &[
+                "cryptsetup",
+                "luksHeaderBackup",
+                device,
+                "--header-backup-file",
+                &dest.to_string_lossy(),
+            ],
+            "back up LUKS2 header (overwriting)",
+        )?
+        .require("luksHeaderBackup")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +303,24 @@ Digests:
         header_backup(&r2, "/dev/x", &dest).unwrap();
         assert!(r2.trace.borrow().is_empty());
         assert_eq!(std::fs::read(&dest).unwrap(), b"pristine");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn header_backup_force_always_backs_up_even_if_dest_exists() {
+        let dir = std::env::temp_dir().join(format!("tpmnt-hdrf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("header-uuid.img");
+        std::fs::write(&dest, b"stale").unwrap();
+
+        // Unlike `header_backup`, the force variant must NOT skip when a backup
+        // already exists — it re-captures a fresh header. (Dry-run so the removal
+        // is skipped and no real cryptsetup runs; we assert the command is traced.)
+        let r = Runner::new(true, false);
+        header_backup_force(&r, "/dev/x", &dest).unwrap();
+        assert_eq!(r.trace.borrow().len(), 1);
+        assert_eq!(r.trace.borrow()[0].argv[1], "luksHeaderBackup");
 
         std::fs::remove_dir_all(&dir).ok();
     }
