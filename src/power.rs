@@ -79,23 +79,74 @@ pub fn physical_device_for(container: &str) -> String {
     real
 }
 
-fn sys_flag(phys: &str, attr: &str) -> bool {
+/// Read a `/sys/block/<dev>/<attr>` boolean flag. `prefix` is a disk's SSH argv
+/// (empty = local): a remote disk's platters live on its host, so its traits and
+/// power state must be read/acted on *there*, not against a nonexistent local
+/// path. For a whole-disk container the `/dev/sdX` name matches on both ends.
+fn sys_flag(ctx: &Context, prefix: &[String], phys: &str, attr: &str) -> bool {
     let base = phys.rsplit('/').next().unwrap_or(phys);
-    std::fs::read_to_string(format!("/sys/block/{base}/{attr}"))
-        .map(|s| s.trim() == "1")
-        .unwrap_or(false)
+    let path = format!("/sys/block/{base}/{attr}");
+    if prefix.is_empty() {
+        std::fs::read_to_string(&path)
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false)
+    } else {
+        ctx.runner
+            .probe_on(prefix, &["cat", &path], "read sysfs device flag")
+            .map(|o| o.stdout.trim() == "1")
+            .unwrap_or(false)
+    }
 }
 
-fn is_rotational(phys: &str) -> bool {
-    sys_flag(phys, "queue/rotational")
+fn is_rotational(ctx: &Context, prefix: &[String], phys: &str) -> bool {
+    sys_flag(ctx, prefix, phys, "queue/rotational")
 }
-fn is_removable(phys: &str) -> bool {
-    sys_flag(phys, "removable")
+fn is_removable(ctx: &Context, prefix: &[String], phys: &str) -> bool {
+    sys_flag(ctx, prefix, phys, "removable")
 }
 
-/// Pick the concrete power-down action for `auto`, given the device's traits.
-fn resolve_method(method: PowerOffMethod, phys: &str) -> PowerOffMethod {
-    resolve_method_traits(method, is_removable(phys), is_rotational(phys))
+/// Pick the concrete power-down action for `auto`, given the device's traits
+/// (read on the disk's host, local or remote).
+fn resolve_method(
+    ctx: &Context,
+    prefix: &[String],
+    method: PowerOffMethod,
+    phys: &str,
+) -> PowerOffMethod {
+    resolve_method_traits(
+        method,
+        is_removable(ctx, prefix, phys),
+        is_rotational(ctx, prefix, phys),
+    )
+}
+
+/// The backing disk's whole-device path *and* the SSH prefix to reach it. A
+/// local disk strips partitions via sysfs; a remote disk's config `device` is
+/// its whole backing disk on the remote host, used verbatim (local sysfs can't
+/// see it). Both power tuning and spindown act through this pair.
+fn phys_and_prefix(ctx: &Context, disk: &Disk) -> (String, Vec<String>) {
+    let container = disk.device_path();
+    let prefix = ctx.config.ssh_prefix_for(disk);
+    let phys = if prefix.is_empty() {
+        physical_device_for(&container)
+    } else {
+        container
+    };
+    (phys, prefix)
+}
+
+/// Prepend `sudo -n` for a remote host — spinning down/tuning a block device
+/// needs root there, and tpmnt's SSH user is unprivileged (matches the
+/// `qemu-nbd`/`luksDump` remote convention in blockdev.rs / adopt.rs). Locally
+/// tpmnt already runs as root (the monitor unit / `sudo tpmnt`), so no wrapper.
+fn priv_argv<'a>(prefix: &[String], argv: &[&'a str]) -> Vec<&'a str> {
+    if prefix.is_empty() {
+        argv.to_vec()
+    } else {
+        let mut v = vec!["sudo", "-n"];
+        v.extend_from_slice(argv);
+        v
+    }
 }
 
 /// Pure trait-to-action mapping, split out so it is testable without touching
@@ -136,15 +187,21 @@ fn resolve_method_traits(
 /// query state with `hdparm -C` — that wakes sleeping drives; the monitor reads
 /// in-kernel `/sys/block/*/stat` counters instead.
 fn tune_spindown_authority(ctx: &Context, disk: &Disk) -> Value {
-    let phys = physical_device_for(&disk.device_path());
+    let (phys, prefix) = phys_and_prefix(ctx, disk);
     let dry = ctx.global.effective_dry_run();
-    // Only meaningful for spinning disks we manage locally; SSD/loop have no
-    // platters to park, and removable/USB power-off doesn't use ATA APM.
-    if !dry && !should_tune_apm(is_rotational(&phys), is_removable(&phys)) {
+    // Only meaningful for spinning disks; SSD/loop have no platters to park, and
+    // removable/USB power-off doesn't use ATA APM. Traits read on the disk's host.
+    if !dry
+        && !should_tune_apm(
+            is_rotational(ctx, &prefix, &phys),
+            is_removable(ctx, &prefix, &phys),
+        )
+    {
         return json!({"step": "tune-power", "device": phys, "skipped": "not a fixed rotational disk"});
     }
-    match ctx.runner.run(
-        &["hdparm", "-B", "254", "-S", "0", &phys],
+    match ctx.runner.run_on(
+        &prefix,
+        &priv_argv(&prefix, &["hdparm", "-B", "254", "-S", "0", &phys]),
         "disable firmware APM parking + standby timer (tpmnt owns spindown)",
     ) {
         Ok(out) if out.ok() => {
@@ -293,15 +350,15 @@ fn spindown_impl(ctx: &Context, disk: &Disk, soft: bool) -> Result<SpinOutcome> 
         }
     }
 
-    // 3. power down the backing physical disk.
-    let container = disk.device_path();
-    let phys = physical_device_for(&container);
-    let resolved = resolve_method(disk.power_off_method, &phys);
+    // 3. power down the backing physical disk (on its host — local or remote).
+    let (phys, prefix) = phys_and_prefix(ctx, disk);
+    let resolved = resolve_method(ctx, &prefix, disk.power_off_method, &phys);
     let (method_used, skip_reason) = match resolved {
         PowerOffMethod::PowerOff => {
             ctx.runner
-                .run(
-                    &["udisksctl", "power-off", "-b", &phys],
+                .run_on(
+                    &prefix,
+                    &priv_argv(&prefix, &["udisksctl", "power-off", "-b", &phys]),
                     "power off backing disk (udisksctl)",
                 )?
                 .require("udisksctl power-off")
@@ -310,14 +367,22 @@ fn spindown_impl(ctx: &Context, disk: &Disk, soft: bool) -> Result<SpinOutcome> 
         }
         PowerOffMethod::Standby => {
             ctx.runner
-                .run(&["hdparm", "-y", &phys], "spin down backing disk (hdparm -y)")?
+                .run_on(
+                    &prefix,
+                    &priv_argv(&prefix, &["hdparm", "-y", &phys]),
+                    "spin down backing disk (hdparm -y)",
+                )?
                 .require("hdparm -y")
                 .map_err(power_err)?;
             ("standby", None)
         }
         PowerOffMethod::Sleep => {
             ctx.runner
-                .run(&["hdparm", "-Y", &phys], "sleep backing disk (hdparm -Y)")?
+                .run_on(
+                    &prefix,
+                    &priv_argv(&prefix, &["hdparm", "-Y", &phys]),
+                    "sleep backing disk (hdparm -Y)",
+                )?
                 .require("hdparm -Y")
                 .map_err(power_err)?;
             ("sleep", None)
