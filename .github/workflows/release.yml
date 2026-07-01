@@ -120,12 +120,12 @@ jobs:
       - uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2
         with:
           tool: cargo-generate-rpm
-      - name: Build binary + man + .rpm
+      - name: Build binary + .rpm
         env:
           TARGET: ${{ matrix.target }}
+        # man/tpmnt.1 is committed (can't run a cross-built binary on this runner).
         run: |
           cargo build --release --target "$TARGET"
-          "target/$TARGET/release/tpmnt" gen-man man/ || cargo run --release --target "$TARGET" -- gen-man man/
           # auto-req disabled: glibc is always present; we declare the tool deps ourselves.
           cargo generate-rpm --target "$TARGET" --auto-req disabled --output "tpmnt-${TARGET}.rpm"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
