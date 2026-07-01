@@ -476,7 +476,7 @@ fn resolve(args: &InitArgs) -> Result<Resolved> {
             .fstype
             .clone()
             .or(spec.fstype)
-            .unwrap_or_else(|| "xfs".into()),
+            .unwrap_or_else(|| "btrfs".into()),
         no_format: args.no_format || spec.no_format.unwrap_or(false),
         no_register: args.no_register || spec.no_register.unwrap_or(false),
         power_profile: {
@@ -725,7 +725,11 @@ fn mkfs(ctx: &Context, fstype: &str, mapper: &str) -> Result<()> {
     let argv: Vec<&str> = match fstype {
         "xfs" => vec!["mkfs.xfs", "-q", &dev],
         "ext4" => vec!["mkfs.ext4", "-q", "-F", &dev],
-        "btrfs" => vec!["mkfs.btrfs", "-q", "-f", &dev],
+        // `-m dup` keeps two copies of metadata on a single disk so btrfs can
+        // self-heal metadata bit rot (the default on btrfs-progs >= 5.15; forced
+        // here for older tools). Data checksums still only *detect* data rot on a
+        // lone disk — that's the point for cold archival.
+        "btrfs" => vec!["mkfs.btrfs", "-q", "-f", "-m", "dup", &dev],
         other => {
             return Err(
                 Error::new(Code::EConfig, format!("unsupported fstype: {other}"))
@@ -983,7 +987,7 @@ fn explain() -> Value {
             { "step": "recovery", "default": "add a recovery key", "bypass": "--no-recovery-key --i-understand-no-recovery" },
             { "step": "escrow", "default": "sealed (systemd-creds/TPM2) bundle to key_backup", "bypass": "--escrow age:|gpg:|pass: | --local-plaintext | --i-understand-no-backup | --emit-secrets" },
             { "step": "tpm", "default": "enroll TPM2 (warn on PCR-only)", "bypass": "--no-tpm | --pcrs | --with-pin" },
-            { "step": "filesystem", "default": "mkfs.xfs", "bypass": "--fstype <t> | --no-format" },
+            { "step": "filesystem", "default": "mkfs.btrfs (data+metadata checksums for bit-rot detection; dup metadata; zstd compression)", "bypass": "--fstype xfs|ext4 | --no-format" },
             { "step": "register", "default": "add [[disk]] + apply + mount", "bypass": "--no-register | --mountpoint | --name" }
         ],
         "errors": [

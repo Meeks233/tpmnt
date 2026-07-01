@@ -94,22 +94,38 @@ pub fn crypttab_line(disk: &Disk) -> String {
 
 /// Mount options for a disk. Cold-standby disks get `noatime` so that reads
 /// don't generate atime writes that would mask idleness from the power monitor.
+/// btrfs (the cold-backup default) also gets `compress=zstd:3` for archival
+/// density — transparent, low-CPU, and applied to new writes.
 pub fn mount_options(disk: &Disk) -> String {
+    let mut opts = vec!["defaults", "nofail"];
     if disk.is_cold_standby() {
-        "defaults,nofail,noatime".to_string()
+        opts.push("noatime");
+    }
+    if disk.fstype == "btrfs" {
+        opts.push("compress=zstd:3");
+    }
+    opts.join(",")
+}
+
+/// fstab fsck pass field: btrfs does its own integrity checking and must not be
+/// fsck'd at boot (pass 0); other filesystems get a normal secondary pass (2).
+fn fsck_pass(disk: &Disk) -> u8 {
+    if disk.fstype == "btrfs" {
+        0
     } else {
-        "defaults,nofail".to_string()
+        2
     }
 }
 
 /// Build the fstab line mapping the decrypted device to its mountpoint.
 pub fn fstab_line(disk: &Disk) -> String {
     format!(
-        "/dev/mapper/{} {} {} {} 0 2",
+        "/dev/mapper/{} {} {} {} 0 {}",
         disk.mapper_name(),
         disk.mountpoint.display(),
         disk.fstype,
         mount_options(disk),
+        fsck_pass(disk),
     )
 }
 
@@ -267,6 +283,17 @@ mod tests {
         assert_eq!(
             fstab_line(&d),
             "/dev/mapper/tpmnt-data /mnt/data xfs defaults,nofail,noatime 0 2"
+        );
+    }
+
+    #[test]
+    fn btrfs_cold_standby_gets_compression_and_pass_zero() {
+        let mut d = disk();
+        d.fstype = "btrfs".into();
+        d.power_profile = crate::config::PowerProfile::ColdStandby;
+        assert_eq!(
+            fstab_line(&d),
+            "/dev/mapper/tpmnt-data /mnt/data btrfs defaults,nofail,noatime,compress=zstd:3 0 0"
         );
     }
 

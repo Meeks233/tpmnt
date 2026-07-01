@@ -179,7 +179,8 @@ pub struct InitArgs {
     #[arg(long)]
     pub with_pin: bool,
 
-    /// Filesystem type to create (default xfs).
+    /// Filesystem to create: "btrfs" (default — data checksums catch cold-storage
+    /// bit rot, dup metadata, zstd compression), "xfs", or "ext4".
     #[arg(long)]
     pub fstype: Option<String>,
     /// Do not create a filesystem (LUKS container only).
