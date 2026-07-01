@@ -305,9 +305,9 @@ enum SpinOutcome {
     Busy(Vec<Value>),
 }
 
-/// What `remove`-method power-off recorded so spin-up can bring the disk back:
-/// the SCSI host to rescan and (for a remote disk) how to rebuild the ciphertext
-/// forward. Persisted only while the disk is removed from its host OS.
+/// What a detach power-off recorded so spin-up can bring the disk back: the SCSI
+/// host to rescan and (for a remote disk) how to rebuild the ciphertext forward.
+/// Persisted only while the disk is detached from its host OS.
 #[derive(Debug, Serialize, Deserialize)]
 struct ForwardState {
     /// True when the disk lives on a remote host reached over SSH.
@@ -318,6 +318,25 @@ struct ForwardState {
     scsi_host: String,
     /// NBD port the remote `qemu-nbd` served on (remote disks only).
     port: u16,
+    /// True when the disk was truly powered off (`udisksctl power-off`) rather than
+    /// just dropped (`device/delete`). A real power-off can take the whole SCSI
+    /// host/enclosure off the bus, so spin-up must fall back from a host rescan to
+    /// a PCI rescan, and an enclosure that stays dark needs a physical reconnect.
+    #[serde(default)]
+    powered_off: bool,
+}
+
+/// Whether a filesystem path exists on the disk's host (local, or remote via a
+/// bounded `test -e` over SSH). Used to probe sysfs before/after a rescan.
+fn host_exists(ctx: &Context, prefix: &[String], path: &str) -> bool {
+    if prefix.is_empty() {
+        Path::new(path).exists()
+    } else {
+        ctx.runner
+            .probe_on(prefix, &["test", "-e", path], "check host path exists")
+            .map(|o| o.ok())
+            .unwrap_or(false)
+    }
 }
 
 /// The `hostN` component of a device's sysfs path — the SCSI host to rescan to
@@ -463,6 +482,7 @@ fn detach_from_os(ctx: &Context, disk: &Disk, action: Disappear) -> Result<Value
         remote_dev: phys.clone(),
         scsi_host: scsi_host.clone(),
         port,
+        powered_off: action == Disappear::PowerOff,
     };
     let sp = ctx.paths.forward_state(&disk.name);
     if let Some(parent) = sp.parent() {
@@ -517,14 +537,29 @@ fn restore_from_os(ctx: &Context, disk: &Disk) -> Result<Option<Value>> {
         .map_err(|e| Error::new(Code::EInternal, format!("corrupt forward state: {e}")))?;
     let prefix = ctx.config.ssh_prefix_for(disk);
 
-    // 1. Rescan the host so the kernel re-probes the (spun-down) disk.
-    sysfs_write(
-        ctx,
-        &prefix,
-        &format!("/sys/class/scsi_host/{}/scan", state.scsi_host),
-        "\"- - -\"",
-        "rescan SCSI host to bring the disk back",
-    )?;
+    // 1. Re-probe the disk. `device/delete` leaves the SCSI host in place, so a
+    //    host rescan brings it back. A true `udisksctl power-off` can take the
+    //    whole host/enclosure off the bus (that's what darkens the LED), so its
+    //    host is gone — fall back to a PCI rescan to re-enumerate the controller.
+    let host_path = format!("/sys/class/scsi_host/{}", state.scsi_host);
+    if host_exists(ctx, &prefix, &host_path) {
+        sysfs_write(
+            ctx,
+            &prefix,
+            &format!("{host_path}/scan"),
+            "\"- - -\"",
+            "rescan SCSI host to bring the disk back",
+        )?;
+    } else {
+        // Host vanished with the powered-off enclosure: re-enumerate the PCI bus.
+        sysfs_write(
+            ctx,
+            &prefix,
+            "/sys/bus/pci/rescan",
+            "1",
+            "rescan PCI bus to re-enumerate a powered-off enclosure",
+        )?;
+    }
 
     // 2. Wait for the backing device to reappear (bounded).
     let check = format!(
@@ -533,31 +568,23 @@ fn restore_from_os(ctx: &Context, disk: &Disk) -> Result<Option<Value>> {
     );
     let mut back = false;
     for _ in 0..30 {
-        let present = if prefix.is_empty() {
-            Path::new(&check).exists()
-        } else {
-            ctx.runner
-                .probe_on(&prefix, &["test", "-e", &check], "await disk re-probe")
-                .map(|o| o.ok())
-                .unwrap_or(false)
-        };
-        if present {
+        if host_exists(ctx, &prefix, &check) {
             back = true;
             break;
         }
         sleep(Duration::from_millis(500));
     }
     if !back {
+        let hint = if state.powered_off {
+            "the enclosure was fully powered off and did not return on a bus rescan; physically reconnect or re-power it, then run `tpmnt power <name> --on`"
+        } else {
+            "the host may not support software rescan; a physical reconnect may be required"
+        };
         return Err(Error::new(
             Code::EPowerOff,
-            format!(
-                "disk {} did not reappear after rescanning {}",
-                state.remote_dev, state.scsi_host
-            ),
+            format!("disk {} did not reappear after a rescan", state.remote_dev),
         )
-        .with_hint(
-            "the host may not support software rescan; a physical reconnect may be required",
-        ));
+        .with_hint(hint));
     }
 
     // 3. Rebuild the ciphertext forward for a remote disk.
@@ -913,6 +940,49 @@ fn save_state(path: &Path, state: &MonitorState) {
     }
 }
 
+/// What a monitor tick should do, decided purely from the idle timing so the
+/// two-stage state machine can be unit-tested without a live mapper/sysfs.
+#[derive(Debug, PartialEq, Eq)]
+enum IdleAction {
+    /// Real access (or first observation): keep the disk up, reset the idle clock.
+    Active,
+    /// Idle but still inside the standby window: leave it alone.
+    Wait,
+    /// Crossed the standby window and not yet parked: spin the platters down now
+    /// (mapping stays open for a transparent wake).
+    EnterStandby,
+    /// Already parked, idle between the standby and power-off windows: keep waiting.
+    HoldStandby,
+    /// Crossed the power-off window: full teardown (unmount + close + power off).
+    PowerOff,
+}
+
+/// Two-stage cold-standby idle decision. Precedence is **activity > power-off >
+/// standby**, so real I/O always resets the clock, and an inverted config
+/// (`poweroff_to <= standby_to`) still powers off rather than parking forever.
+fn decide_idle(
+    activity: bool,
+    idle_secs: u64,
+    standby_to: u64,
+    poweroff_to: u64,
+    already_standby: bool,
+) -> IdleAction {
+    if activity {
+        return IdleAction::Active;
+    }
+    if idle_secs >= poweroff_to {
+        return IdleAction::PowerOff;
+    }
+    if idle_secs >= standby_to {
+        return if already_standby {
+            IdleAction::HoldStandby
+        } else {
+            IdleAction::EnterStandby
+        };
+    }
+    IdleAction::Wait
+}
+
 /// One monitor tick: observe real I/O, update idle state, and spin the disk down
 /// if it has been idle past its window. Idempotent and safe to call on a repeat.
 pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
@@ -954,75 +1024,79 @@ pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
         Some(s) if s.counter == counter => (now.saturating_sub(s.last_change), false),
         _ => (0, true), // first observation or counter advanced => real access
     };
+    let already = prev.as_ref().map(|s| s.standby).unwrap_or(false);
+    let dry = ctx.global.effective_dry_run();
 
-    if activity {
-        if !ctx.global.effective_dry_run() {
-            // Real access wakes any parked platters: clear the standby flag.
-            save_state(
-                &state_path,
-                &MonitorState {
-                    counter,
-                    last_change: now,
-                    standby: false,
-                },
-            );
-        }
-        // First time we see this disk open this session: claim sole spindown
-        // authority + disable aggressive firmware APM head-parking.
-        let tune = first_obs.then(|| tune_spindown_authority(ctx, disk));
-        return Ok(json!({
-            "ok": true, "action": "keep", "name": disk.name,
-            "io_counter": counter, "idle_secs": 0,
-            "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
-            "reason": "real access detected", "tune": tune,
-        }));
-    }
-
-    // Stage 2: fully idle past the power-off window -> unmount + close + power off.
-    if idle_secs >= poweroff_to {
-        let sd = spindown(ctx, disk, None)?; // resets/removes monitor state on success
-        return Ok(json!({
-            "ok": true, "action": "power-off", "name": disk.name,
-            "io_counter": counter, "idle_secs": idle_secs,
-            "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
-            "spindown": sd,
-        }));
-    }
-
-    // Stage 1: idle past the standby window -> park the platters, keep the mapping
-    // open (transparent wake on next access). Issued once per idle stretch.
-    if idle_secs >= standby_to {
-        let already = prev.as_ref().map(|s| s.standby).unwrap_or(false);
-        if already {
-            return Ok(json!({
+    match decide_idle(activity, idle_secs, standby_to, poweroff_to, already) {
+        IdleAction::Active => {
+            if !dry {
+                // Real access wakes any parked platters: clear the standby flag.
+                save_state(
+                    &state_path,
+                    &MonitorState {
+                        counter,
+                        last_change: now,
+                        standby: false,
+                    },
+                );
+            }
+            // First time we see this disk open this session: claim sole spindown
+            // authority + disable aggressive firmware APM head-parking.
+            let tune = first_obs.then(|| tune_spindown_authority(ctx, disk));
+            Ok(json!({
                 "ok": true, "action": "keep", "name": disk.name,
+                "io_counter": counter, "idle_secs": 0,
+                "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
+                "reason": "real access detected", "tune": tune,
+            }))
+        }
+
+        // Stage 2: fully idle past the power-off window -> unmount + close + power off.
+        IdleAction::PowerOff => {
+            let sd = spindown(ctx, disk, None)?; // resets/removes monitor state on success
+            Ok(json!({
+                "ok": true, "action": "power-off", "name": disk.name,
                 "io_counter": counter, "idle_secs": idle_secs,
                 "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
-                "reason": "in standby; awaiting power-off window",
-            }));
+                "spindown": sd,
+            }))
         }
-        let standby = enter_standby(ctx, disk);
-        if !ctx.global.effective_dry_run() {
-            // Preserve last_change (idle keeps counting toward power-off); mark parked.
-            if let Some(mut s) = prev {
-                s.standby = true;
-                save_state(&state_path, &s);
+
+        // Stage 1: idle past the standby window -> park the platters, keep the
+        // mapping open (transparent wake on next access). Issued once per stretch.
+        IdleAction::EnterStandby => {
+            let standby = enter_standby(ctx, disk);
+            if !dry {
+                // Preserve counter/last_change (idle keeps counting toward
+                // power-off); just mark the platters parked. prev is Some whenever
+                // activity is false, so this always persists.
+                if let Some(mut s) = prev {
+                    s.standby = true;
+                    save_state(&state_path, &s);
+                }
             }
+            Ok(json!({
+                "ok": true, "action": "standby", "name": disk.name,
+                "io_counter": counter, "idle_secs": idle_secs,
+                "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
+                "standby": standby,
+            }))
         }
-        return Ok(json!({
-            "ok": true, "action": "standby", "name": disk.name,
+
+        IdleAction::HoldStandby => Ok(json!({
+            "ok": true, "action": "keep", "name": disk.name,
             "io_counter": counter, "idle_secs": idle_secs,
             "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
-            "standby": standby,
-        }));
-    }
+            "reason": "in standby; awaiting power-off window",
+        })),
 
-    Ok(json!({
-        "ok": true, "action": "keep", "name": disk.name,
-        "io_counter": counter, "idle_secs": idle_secs,
-        "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
-        "reason": "idle but within standby window",
-    }))
+        IdleAction::Wait => Ok(json!({
+            "ok": true, "action": "keep", "name": disk.name,
+            "io_counter": counter, "idle_secs": idle_secs,
+            "standby_timeout_secs": standby_to, "poweroff_timeout_secs": poweroff_to,
+            "reason": "idle but within standby window",
+        })),
+    }
 }
 
 /// Persisted state for a disk's scheduled power-off grace period.
@@ -1309,6 +1383,80 @@ mod tests {
     fn physical_device_strips_only_real_partitions() {
         // Without sysfs we can't classify, so a whole-device path round-trips.
         assert_eq!(physical_device_for("/dev/loop0"), "/dev/loop0");
+    }
+
+    // --- Two-stage cold-standby idle state machine (5min standby / 30min off) ---
+
+    const STANDBY: u64 = 300; // 5 min
+    const OFF: u64 = 1800; // 30 min
+
+    #[test]
+    fn idle_walkthrough_default_5min_30min() {
+        use IdleAction::*;
+        // Real access always resets, whatever the idle number says.
+        assert_eq!(decide_idle(true, 99_999, STANDBY, OFF, false), Active);
+        assert_eq!(decide_idle(true, 0, STANDBY, OFF, true), Active);
+
+        // Idle but inside the standby window (0 <= idle < 5min): leave it alone.
+        assert_eq!(decide_idle(false, 0, STANDBY, OFF, false), Wait);
+        assert_eq!(decide_idle(false, 299, STANDBY, OFF, false), Wait);
+
+        // Exactly at the standby threshold, not yet parked: park now.
+        assert_eq!(decide_idle(false, 300, STANDBY, OFF, false), EnterStandby);
+        assert_eq!(decide_idle(false, 900, STANDBY, OFF, false), EnterStandby);
+
+        // Already parked, between standby and power-off windows: keep waiting.
+        assert_eq!(decide_idle(false, 300, STANDBY, OFF, true), HoldStandby);
+        assert_eq!(decide_idle(false, 1799, STANDBY, OFF, true), HoldStandby);
+
+        // At/over the power-off threshold: full teardown, regardless of parked flag.
+        assert_eq!(decide_idle(false, 1800, STANDBY, OFF, false), PowerOff);
+        assert_eq!(decide_idle(false, 1800, STANDBY, OFF, true), PowerOff);
+        assert_eq!(decide_idle(false, 9_999, STANDBY, OFF, true), PowerOff);
+    }
+
+    #[test]
+    fn power_off_wins_over_standby_at_boundary() {
+        // The instant idle reaches the power-off window it must power off, even if
+        // it hasn't been parked yet (e.g. a coarse poll jumped past both windows).
+        assert_eq!(
+            decide_idle(false, 1800, STANDBY, OFF, false),
+            IdleAction::PowerOff
+        );
+    }
+
+    #[test]
+    fn inverted_config_never_parks_forever() {
+        // Misconfig where power-off <= standby: power-off precedence means the disk
+        // still goes down instead of parking indefinitely and never powering off.
+        assert_eq!(decide_idle(false, 60, 300, 60, false), IdleAction::PowerOff);
+        assert_eq!(decide_idle(false, 60, 300, 60, true), IdleAction::PowerOff);
+        // Below the (lower) power-off threshold it just waits.
+        assert_eq!(decide_idle(false, 30, 300, 60, false), IdleAction::Wait);
+    }
+
+    #[test]
+    fn full_lifecycle_transitions_in_order() {
+        use IdleAction::*;
+        // Simulate the exact sequence the monitor walks a disk through with the
+        // 1min/2min test tuning validated on the real remote disk.
+        let (s, o) = (60u64, 120u64);
+        // t<60 idle -> wait; ==60 -> enter standby; parked & <120 -> hold; >=120 -> off.
+        let seq = [
+            (false, 0, false, Wait),
+            (false, 59, false, Wait),
+            (false, 61, false, EnterStandby),
+            (false, 74, true, HoldStandby),
+            (false, 110, true, HoldStandby),
+            (false, 122, true, PowerOff),
+        ];
+        for (act, idle, parked, want) in seq {
+            assert_eq!(
+                decide_idle(act, idle, s, o, parked),
+                want,
+                "idle={idle} parked={parked}"
+            );
+        }
     }
 
     #[test]
