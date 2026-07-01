@@ -119,6 +119,53 @@ fn resolve_method_traits(
     }
 }
 
+/// Make tpmnt the *sole* spindown authority for a freshly-spun-up rotational
+/// disk. The dominant HDD wear source is not continuous spinning but frequent
+/// cycling — above all the drive's own aggressive APM head-parking, which can
+/// burn through the ~300k load-cycle budget in months. So on every spin-up we:
+///   * `-B 254` — highest APM: keep the drive responsive with no firmware
+///     auto-parking/spindown while it's actually in use this session, and
+///   * `-S 0`   — disable the drive's internal standby timer, so tpmnt's own
+///     deliberate, well-spaced idle-spindown is the *only* thing that ever
+///     stops the platters (no competing timers thrashing the motor).
+///
+/// These settings reset across a standby cycle, hence re-applying on each open.
+///
+/// Best-effort: rotational, non-removable disks only, and a drive/bridge that
+/// doesn't support APM just fails harmlessly (recorded, never fatal). We never
+/// query state with `hdparm -C` — that wakes sleeping drives; the monitor reads
+/// in-kernel `/sys/block/*/stat` counters instead.
+fn tune_spindown_authority(ctx: &Context, disk: &Disk) -> Value {
+    let phys = physical_device_for(&disk.device_path());
+    let dry = ctx.global.effective_dry_run();
+    // Only meaningful for spinning disks we manage locally; SSD/loop have no
+    // platters to park, and removable/USB power-off doesn't use ATA APM.
+    if !dry && !should_tune_apm(is_rotational(&phys), is_removable(&phys)) {
+        return json!({"step": "tune-power", "device": phys, "skipped": "not a fixed rotational disk"});
+    }
+    match ctx.runner.run(
+        &["hdparm", "-B", "254", "-S", "0", &phys],
+        "disable firmware APM parking + standby timer (tpmnt owns spindown)",
+    ) {
+        Ok(out) if out.ok() => {
+            json!({"step": "tune-power", "device": phys, "apm": 254, "standby_timer": "off"})
+        }
+        Ok(out) => {
+            json!({"step": "tune-power", "device": phys, "skipped": "APM unsupported", "stderr": out.stderr.trim()})
+        }
+        Err(e) => {
+            json!({"step": "tune-power", "device": phys, "skipped": "hdparm unavailable", "error": e.message})
+        }
+    }
+}
+
+/// APM tuning applies only to fixed rotational disks: SSD/loop have no platters
+/// to park, and removable/USB drives use `udisksctl power-off` (not ATA APM).
+/// Split out pure so it's testable without touching host-specific `/sys/block`.
+fn should_tune_apm(rotational: bool, removable: bool) -> bool {
+    rotational && !removable
+}
+
 /// Minimal systemd unit-name escaping for a dm-crypt mapper name (used to build
 /// the `systemd-cryptsetup@<inst>.service` instance). Matches `systemd-escape`
 /// for the `[A-Za-z0-9:_.-]`-style names cryptsetup uses (`-` -> `\x2d`, etc).
@@ -366,6 +413,9 @@ pub fn spinup(ctx: &Context, disk: &Disk) -> Result<Value> {
         }
     }
 
+    // Disk is up: claim sole spindown authority + kill aggressive APM parking.
+    steps.push(tune_spindown_authority(ctx, disk));
+
     Ok(json!({
         "ok": true,
         "action": "power-on",
@@ -428,6 +478,7 @@ pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
     let now = now_epoch();
     let prev = load_state(&state_path);
 
+    let first_obs = prev.is_none();
     let (idle_secs, activity) = match &prev {
         Some(s) if s.counter == counter => (now.saturating_sub(s.last_change), false),
         _ => (0, true), // first observation or counter advanced => real access
@@ -443,10 +494,13 @@ pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
                 },
             );
         }
+        // First time we see this disk open this session: claim sole spindown
+        // authority + disable aggressive firmware APM head-parking.
+        let tune = first_obs.then(|| tune_spindown_authority(ctx, disk));
         return Ok(json!({
             "ok": true, "action": "keep", "name": disk.name,
             "io_counter": counter, "idle_secs": 0, "idle_timeout_secs": timeout,
-            "reason": "real access detected",
+            "reason": "real access detected", "tune": tune,
         }));
     }
 
@@ -795,6 +849,17 @@ mod tests {
         assert_eq!(st.off_deadline, 123);
         assert!(st.deferred);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apm_tuning_targets_only_fixed_rotational_disks() {
+        // Spinning internal HDD => tune (disable aggressive parking, own spindown).
+        assert!(should_tune_apm(true, false));
+        // Removable spinning (USB dock) => skip: power-off path, not ATA APM.
+        assert!(!should_tune_apm(true, true));
+        // SSD / loop (non-rotational) => skip: no platters to park.
+        assert!(!should_tune_apm(false, false));
+        assert!(!should_tune_apm(false, true));
     }
 
     #[test]
