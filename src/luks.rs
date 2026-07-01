@@ -166,9 +166,17 @@ fn parse_token_type(line: &str) -> Option<String> {
     Some(ty.trim().to_string())
 }
 
-/// Back up the LUKS2 header to a file. Idempotent path naming is the caller's
-/// responsibility (it should include a timestamp or device id).
+/// Back up the LUKS2 header to a file, keyed by UUID. Idempotent: if a backup
+/// already exists we keep it and skip — `cryptsetup luksHeaderBackup` refuses to
+/// overwrite (it would error), and the FIRST backup is the pristine pre-management
+/// header that `rollback` must restore. A later re-enrollment (e.g. `pin enable`
+/// wiping+re-adding the TPM2 slot) therefore must not clobber it.
 pub fn header_backup(runner: &Runner, device: &str, dest: &Path) -> Result<()> {
+    // A pre-existing backup is the one we want to preserve; don't overwrite (and
+    // don't fail). Under dry-run `dest` won't exist, so the step is still traced.
+    if dest.exists() {
+        return Ok(());
+    }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::new(Code::EInternal, format!("mkdir {}: {e}", parent.display())))?;
@@ -244,5 +252,28 @@ Digests:
     fn ignores_deeply_indented_key_data() {
         let info = parse_luks_dump("Version:\t2\nKeyslots:\n  0: luks2\n\tAF stripes: 4000\n");
         assert_eq!(info.keyslots, vec![0]);
+    }
+
+    #[test]
+    fn header_backup_is_idempotent_and_preserves_the_first() {
+        let dir = std::env::temp_dir().join(format!("tpmnt-hdr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("header-uuid.img");
+
+        // First call (dry-run): dest doesn't exist yet -> the backup command is traced.
+        let r = Runner::new(true, false);
+        header_backup(&r, "/dev/x", &dest).unwrap();
+        assert_eq!(r.trace.borrow().len(), 1);
+        assert_eq!(r.trace.borrow()[0].argv[1], "luksHeaderBackup");
+
+        // Simulate the backup now existing; a second call must skip (no trace, no
+        // overwrite) so a re-enroll can't clobber the pristine pre-management header.
+        std::fs::write(&dest, b"pristine").unwrap();
+        let r2 = Runner::new(true, false);
+        header_backup(&r2, "/dev/x", &dest).unwrap();
+        assert!(r2.trace.borrow().is_empty());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"pristine");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
