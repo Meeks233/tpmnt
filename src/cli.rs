@@ -64,6 +64,10 @@ pub enum Command {
     Init(InitArgs),
     /// Authenticate and retrieve a disk's generated key; optionally open it.
     Recover(RecoverArgs),
+    /// Temporarily detach a disk (grace unmount + close); data & config kept.
+    Offline(OfflineArgs),
+    /// Permanently remove a disk's local management (needs --yes); no format.
+    Destroy(DestroyArgs),
     /// Enroll TPM2 on an existing LUKS2 device (asks for the passphrase once).
     Enroll(EnrollArgs),
     /// Idempotently reconcile the system (crypttab/fstab/units) to the config.
@@ -207,6 +211,24 @@ pub struct InitArgs {
     /// Print a human+machine description of every default and its bypass flag.
     #[arg(long)]
     pub explain: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct OfflineArgs {
+    /// Name of the [[disk]] to detach.
+    pub name: String,
+    /// Lazily detach a busy mount (`umount -l`) instead of failing on busy.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DestroyArgs {
+    /// Name of the [[disk]] to stop managing. Confirm with the global --yes.
+    pub name: String,
+    /// Lazily detach a busy mount (`umount -l`) during teardown.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]

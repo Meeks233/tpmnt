@@ -3,10 +3,12 @@
 //! command plan instead of applying.
 
 pub mod apply;
+pub mod destroy;
 pub mod enroll;
 pub mod init;
 pub mod migrate;
 pub mod mount_remote;
+pub mod offline;
 pub mod power;
 pub mod recover;
 pub mod remote;

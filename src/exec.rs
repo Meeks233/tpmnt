@@ -75,6 +75,16 @@ impl Runner {
         self.run_inner(&refs, why, false, &[], None)
     }
 
+    /// Like `run`, but runs `argv` on a remote by prepending `prefix` (an SSH
+    /// argv). An empty prefix runs locally, so callers pass a disk's prefix
+    /// uniformly. Skipped (but recorded, as the full wrapped command) under
+    /// --dry-run, so `--plan` shows the real remote invocation.
+    pub fn run_on(&self, prefix: &[String], argv: &[&str], why: &str) -> Result<Output> {
+        let wrapped = wrap(prefix, argv);
+        let refs: Vec<&str> = wrapped.iter().map(String::as_str).collect();
+        self.run_inner(&refs, why, true, &[], None)
+    }
+
     /// Like `run`, but injects environment variables (e.g. `$PASSWORD` for
     /// systemd-cryptenroll). Env values are NOT recorded in the trace.
     pub fn run_env(&self, argv: &[&str], envs: &[(&str, &str)], why: &str) -> Result<Output> {

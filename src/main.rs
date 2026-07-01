@@ -54,6 +54,8 @@ fn main() -> ExitCode {
     let result: Result<Value> = match &cli.command {
         Command::Init(a) => cmd::init::run(&ctx, a),
         Command::Recover(a) => cmd::recover::run(&ctx, a),
+        Command::Offline(a) => cmd::offline::run(&ctx, a),
+        Command::Destroy(a) => cmd::destroy::run(&ctx, a),
         Command::Enroll(a) => cmd::enroll::run(&ctx, a),
         Command::Apply => cmd::apply::run(&ctx),
         Command::Status | Command::Dashboard => cmd::status::run(&ctx),
@@ -109,6 +111,11 @@ fn render_human(command: &Command, value: &Value) {
                     if let Some(n) = d.get("name").and_then(|v| v.as_str()) {
                         println!("  - {n}");
                     }
+                }
+            }
+            if let Some(warnings) = value.get("warnings").and_then(|v| v.as_array()) {
+                for w in warnings.iter().filter_map(|v| v.as_str()) {
+                    println!("  warning: {w}");
                 }
             }
         }

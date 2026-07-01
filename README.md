@@ -190,6 +190,26 @@ needed even for `--with-pin` disks. Point `--from creds:<file>` / `--from plaint
 alternate bundle. To keep the old cleartext behavior, `tpmnt init --local-plaintext
 --i-understand-plaintext-keys`.
 
+## Taking a disk offline vs. destroying it
+
+Two lifecycle verbs, both **data-safe** (neither ever formats or overwrites the ciphertext):
+
+```sh
+# Temporarily detach — you'll bring it back later (e.g. to change the PSU):
+sudo tpmnt offline mycache             # grace unmount + close; fails if busy
+sudo tpmnt offline mycache --force     # lazily detach a busy mount (umount -l)
+
+# Permanently retire — remove all local management, keep the encrypted data:
+sudo tpmnt destroy mycache --yes       # --yes required, even for automation
+```
+
+`offline` leaves the config/crypttab/fstab in place, so a reboot, `tpmnt recover --open`, or the
+next scheduled spinup brings the disk right back. `destroy` purges the local footprint (config
+entry, crypttab/fstab lines, systemd units, sealed/escrow key bundles, header backup, state) but
+**deliberately does not format the device** — LUKS ciphertext is safe at rest. It warns if it's
+about to delete the only copy of the key (no offline `--escrow` present). Both refuse a busy mount
+without `--force`, and both operate on remote disks over SSH transparently.
+
 ## Remote mounts with jump hosts (Phase C)
 
 `tpmnt mount-remote` mounts a remote, already-decrypted tpmnt directory onto **this** machine over
@@ -375,6 +395,8 @@ sudo tpmnt apply --plan
 |---|---|
 | `tpmnt init <device>` | Greenfield whole-disk init: partition → LUKS2 → keys → escrow → TPM2 → fs → register + mount. Safe-by-default, every step bypassable. `--explain` lists all defaults. |
 | `tpmnt recover <name>` | Authenticate (root + this host's TPM) and retrieve a disk's generated key from the sealed store. `--show` reveals it; `--open` unlocks the LUKS mapping now for when TPM auto-unlock is broken. |
+| `tpmnt offline <name>` | Temporarily detach a disk: grace unmount → `cryptsetup close` (ciphertext at rest). Data **and** config are kept, so it can be brought back later. `--force` lazily detaches a busy mount. Remote disks are torn down over SSH. |
+| `tpmnt destroy <name>` | Permanently drop a disk's local management (config, crypttab/fstab, units, key bundles, header backup). Requires `--yes` (even for AI). **Does not format** — the LUKS ciphertext is left intact; reformat later if you need the space. |
 | `tpmnt enroll <device>` | Back up the LUKS2 header, then enroll a TPM2 token via `systemd-cryptenroll`. Refuses TPM-only setups that have no passphrase fallback. |
 | `tpmnt apply` | Idempotently reconcile crypttab + the mount backend (fstab or systemd `.mount`) to the TOML. |
 | `tpmnt status` | Per disk: LUKS2? TPM2 token? crypttab entry? mounted? Plus environment detection. |

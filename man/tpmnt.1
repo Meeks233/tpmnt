@@ -46,6 +46,12 @@ Greenfield: fully\-managed initialization of a (possibly blank) disk
 tpmnt\-recover(1)
 Authenticate and retrieve a disk\*(Aqs generated key; optionally open it
 .TP
+tpmnt\-offline(1)
+Temporarily detach a disk (grace unmount + close); data & config kept
+.TP
+tpmnt\-destroy(1)
+Permanently remove a disk\*(Aqs local management (needs \-\-yes); no format
+.TP
 tpmnt\-enroll(1)
 Enroll TPM2 on an existing LUKS2 device (asks for the passphrase once)
 .TP

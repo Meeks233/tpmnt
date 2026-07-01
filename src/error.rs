@@ -47,6 +47,9 @@ pub enum Code {
     EIdentityMissing,
     /// A disk power-down command (hdparm/udisksctl) failed.
     EPowerOff,
+    /// A destructive lifecycle op (e.g. `destroy`) was invoked without the
+    /// required explicit confirmation.
+    EConfirmationRequired,
 }
 
 impl Code {
@@ -71,6 +74,7 @@ impl Code {
             Code::EMountpointBusy => "E_MOUNTPOINT_BUSY",
             Code::EIdentityMissing => "E_IDENTITY_MISSING",
             Code::EPowerOff => "E_POWER_OFF",
+            Code::EConfirmationRequired => "E_CONFIRMATION_REQUIRED",
         }
     }
 
@@ -96,6 +100,7 @@ impl Code {
             Code::EMountpointBusy => 18,
             Code::EIdentityMissing => 19,
             Code::EPowerOff => 20,
+            Code::EConfirmationRequired => 21,
         }
     }
 }
