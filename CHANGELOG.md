@@ -4,6 +4,12 @@ All notable changes to tpmnt are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.3](https://github.com/Meeks233/tpmnt/compare/v0.3.2...v0.3.3) - 2026-07-02
+
+### Other
+
+- move actions off deprecated Node 20 and document release-plz flow
+
 ## [0.3.2](https://github.com/Meeks233/tpmnt/compare/v0.3.1...v0.3.2) - 2026-07-02
 
 ### Added
