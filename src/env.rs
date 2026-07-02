@@ -12,6 +12,10 @@ pub struct EnvInfo {
     pub tpm_rm_present: bool,
     pub tpm_path: Option<String>,
     pub initramfs: Initramfs,
+    /// Effective uid is 0. Reading LUKS headers (`cryptsetup luksDump`) and the
+    /// root-only key store both require this; without it `status`/`dashboard`
+    /// silently misreport every disk as "not LUKS2" and "unmanaged".
+    pub privileged: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -31,6 +35,7 @@ impl EnvInfo {
             tpm_rm_present: Path::new("/dev/tpmrm0").exists(),
             tpm_path: tpm_path(),
             initramfs: detect_initramfs(),
+            privileged: detect_privileged(),
         }
     }
 
@@ -75,6 +80,22 @@ fn detect_systemd_version() -> Option<u32> {
         .collect::<String>()
         .parse()
         .ok()
+}
+
+/// Effective uid == 0, read without a `libc` dependency from `/proc/self/status`.
+/// The `Uid:` line is `real<TAB>effective<TAB>saved<TAB>fs`; the effective uid is
+/// the one that governs file access. Missing/unparsable `/proc` conservatively
+/// reads as unprivileged so we warn rather than falsely claim full access.
+fn detect_privileged() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("Uid:"))
+                .and_then(|rest| rest.split_whitespace().nth(1).map(|s| s.to_string()))
+        })
+        .map(|euid| euid == "0")
+        .unwrap_or(false)
 }
 
 fn detect_initramfs() -> Initramfs {

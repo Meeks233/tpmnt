@@ -187,6 +187,13 @@ pub fn render_table(value: &Value) -> String {
                 .unwrap_or(false),
             env.get("initramfs").and_then(|v| v.as_str()).unwrap_or("?"),
         ));
+        // See render_dashboard: non-root can't read headers or the key store,
+        // so LUKS2/MANAGED columns would be uniformly (and falsely) "no".
+        if env.get("privileged").and_then(|v| v.as_bool()) == Some(false) {
+            out.push_str(
+                "warning: not running as root — LUKS2/MANAGED columns can't be read; re-run with sudo\n",
+            );
+        }
     }
     out.push_str(&format!(
         "{:<12} {:<11} {:<7} {:<6} {:<9} {:<8} {:<13} {}\n",
@@ -387,6 +394,18 @@ pub fn render_dashboard(value: &Value) -> String {
             s(env, "initramfs"),
             tpm_str,
         ));
+        // Without root, `cryptsetup luksDump` and the root-only key store are
+        // both unreadable, so every disk would misreport as "not LUKS2" and
+        // "unmanaged". Warn loudly rather than let the panels lie.
+        if env.get("privileged").and_then(|v| v.as_bool()) == Some(false) {
+            out.push_str(&format!(
+                " {}\n",
+                paint(
+                    "⚠ not running as root — LUKS2 and management state can't be read; re-run with sudo",
+                    &format!("{BOLD}{YELLOW}"),
+                ),
+            ));
+        }
     }
     out.push('\n');
 
@@ -658,6 +677,22 @@ mod tests {
             !out.contains('\x1b'),
             "NO_COLOR output must carry no escapes"
         );
+    }
+
+    #[test]
+    fn dashboard_warns_when_unprivileged() {
+        std::env::set_var("NO_COLOR", "1");
+        // Non-root: header must carry the warning so misreported LUKS2/managed
+        // panels aren't taken at face value.
+        let mut v = sample();
+        v["env"]["privileged"] = json!(false);
+        assert!(render_dashboard(&v).contains("not running as root"));
+        assert!(render_table(&v).contains("not running as root"));
+
+        // Root (or unknown): no warning.
+        v["env"]["privileged"] = json!(true);
+        assert!(!render_dashboard(&v).contains("not running as root"));
+        assert!(!render_dashboard(&sample()).contains("not running as root"));
     }
 
     #[test]
