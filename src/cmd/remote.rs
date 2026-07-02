@@ -6,7 +6,8 @@
 use serde_json::{json, Value};
 
 use crate::cli::{
-    RemoteAction, RemoteAddArgs, RemoteArgs, RemoteListArgs, RemoteRemoveArgs, RemoteToggleArgs,
+    RemoteAction, RemoteAddArgs, RemoteArgs, RemoteListArgs, RemoteRemoveArgs, RemoteRenameArgs,
+    RemoteToggleArgs,
 };
 use crate::config::{Config, Remote};
 use crate::error::{Code, Error, Result};
@@ -17,12 +18,81 @@ pub fn run(ctx: &Context, args: &RemoteArgs) -> Result<Value> {
     match &args.action {
         Some(RemoteAction::Add(add)) => add_remote(ctx, add),
         Some(RemoteAction::Remove(rm)) => remove_remote(ctx, rm),
+        Some(RemoteAction::Rename(rn)) => rename_remote(ctx, rn),
         Some(RemoteAction::Enable(t)) => toggle_remote(ctx, t, true),
         Some(RemoteAction::Disable(t)) => toggle_remote(ctx, t, false),
         // Bare `tpmnt remote` (no subcommand) and `remote list` both list.
         Some(RemoteAction::List(list)) => list_remotes(ctx, list),
         None => list_remotes(ctx, &RemoteListArgs::default()),
     }
+}
+
+/// `tpmnt remote rename <old> <new>` — rename a remote and re-point every disk
+/// that lives on it. The remote's name is purely a logical label (crypttab/mounts
+/// don't reference it), so this is safe even while its disks are connected — only
+/// the config binding and the runtime state file move. Common fix for a remote
+/// first registered under an ad-hoc name (e.g. the SSH user) before you wanted its
+/// real hostname.
+fn rename_remote(ctx: &Context, args: &RemoteRenameArgs) -> Result<Value> {
+    let dry = ctx.global.effective_dry_run();
+    let (old, new) = (args.old.as_str(), args.new.as_str());
+
+    if !ctx.config.remotes.iter().any(|r| r.name == old) {
+        return Err(
+            Error::new(Code::EConfig, format!("no [[remote]] named {old:?}"))
+                .with_hint("run `tpmnt remote` to list configured remotes"),
+        );
+    }
+    if old == new {
+        return Err(Error::new(
+            Code::EConfig,
+            format!("remote is already named {new:?}"),
+        ));
+    }
+    if ctx.config.remotes.iter().any(|r| r.name == new) {
+        return Err(Error::new(
+            Code::EConfig,
+            format!("a [[remote]] named {new:?} already exists"),
+        )
+        .with_hint("choose a name not already in use"));
+    }
+
+    let mut cfg = ctx.config.clone();
+    for r in cfg.remotes.iter_mut() {
+        if r.name == old {
+            r.name = new.to_string();
+        }
+    }
+    let repointed: Vec<String> = cfg
+        .disks
+        .iter_mut()
+        .filter(|d| d.remote.as_deref() == Some(old))
+        .map(|d| {
+            d.remote = Some(new.to_string());
+            d.name.clone()
+        })
+        .collect();
+
+    if !dry {
+        // Carry the runtime state (last-connected + give-up streak) to the new name.
+        let (from, to) = (ctx.paths.remote_state(old), ctx.paths.remote_state(new));
+        if from.exists() {
+            if let Some(parent) = to.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::rename(&from, &to);
+        }
+        cfg.save(&ctx.global.config)?;
+    }
+
+    Ok(json!({
+        "ok": true,
+        "action": "remote-rename",
+        "dry_run": dry,
+        "old": old,
+        "new": new,
+        "repointed_disks": repointed,
+    }))
 }
 
 /// `tpmnt remote enable|disable <name>…` — flip a remote's persistent `enabled`
@@ -409,6 +479,23 @@ pub fn render_table(value: &Value) -> String {
         return format!("{head}: {}\n", removed.join(", "));
     }
 
+    if value.get("action").and_then(|v| v.as_str()) == Some("remote-rename") {
+        let dry = value.get("dry_run").and_then(|v| v.as_bool()) == Some(true);
+        let old = value.get("old").and_then(|v| v.as_str()).unwrap_or("?");
+        let new = value.get("new").and_then(|v| v.as_str()).unwrap_or("?");
+        let disks: Vec<&str> = value
+            .get("repointed_disks")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let pre = if dry { "would rename " } else { "renamed " };
+        let mut s = format!("{pre}remote: {old} → {new}\n");
+        if !disks.is_empty() {
+            s.push_str(&format!("  re-pointed disk(s): {}\n", disks.join(", ")));
+        }
+        return s;
+    }
+
     if value.get("action").and_then(|v| v.as_str()) == Some("remote-toggle") {
         let enable = value.get("enable").and_then(|v| v.as_bool()) == Some(true);
         let dry = value.get("dry_run").and_then(|v| v.as_bool()) == Some(true);
@@ -547,5 +634,41 @@ transport = "nbd"
         let cfg = cfg_two_remotes();
         assert_eq!(disks_on(&cfg, "nas"), vec!["coldstore"]);
         assert!(disks_on(&cfg, "shed").is_empty());
+    }
+
+    /// The pure part of a rename: the remote is relabeled and every disk on it is
+    /// re-pointed. (The command wrapper adds validation + the state-file move.)
+    #[test]
+    fn rename_relabels_remote_and_repoints_disks() {
+        let mut cfg = cfg_two_remotes();
+        for r in cfg.remotes.iter_mut() {
+            if r.name == "nas" {
+                r.name = "windows11".into();
+            }
+        }
+        let repointed: Vec<String> = cfg
+            .disks
+            .iter_mut()
+            .filter(|d| d.remote.as_deref() == Some("nas"))
+            .map(|d| {
+                d.remote = Some("windows11".into());
+                d.name.clone()
+            })
+            .collect();
+        assert_eq!(repointed, vec!["coldstore".to_string()]);
+        assert!(cfg.remotes.iter().any(|r| r.name == "windows11"));
+        assert!(cfg.remotes.iter().all(|r| r.name != "nas"));
+        assert_eq!(cfg.disks[0].remote.as_deref(), Some("windows11"));
+    }
+
+    #[test]
+    fn render_rename_lists_repointed_disks() {
+        let v = json!({
+            "action": "remote-rename", "dry_run": false,
+            "old": "alice", "new": "windows11", "repointed_disks": ["coldstore"],
+        });
+        let out = render_table(&v);
+        assert!(out.contains("renamed remote: alice → windows11"));
+        assert!(out.contains("re-pointed disk(s): coldstore"));
     }
 }

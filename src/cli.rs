@@ -245,7 +245,8 @@ pub struct InitArgs {
     /// Do not register in the config or mount (disk work only).
     #[arg(long)]
     pub no_register: bool,
-    /// Mountpoint (default /mnt/<name>).
+    /// Mountpoint (default /mnt/<name>). Stable and location-independent — it does
+    /// NOT change when the disk moves local↔remote; don't encode local/remote in it.
     #[arg(long)]
     pub mountpoint: Option<PathBuf>,
     /// Logical disk name (default derived from device basename).
@@ -340,7 +341,8 @@ pub struct AdoptArgs {
     /// LUKS ciphertext is forwarded here, decryption stays local).
     #[arg(long)]
     pub remote: Option<String>,
-    /// Mountpoint for a newly-registered disk (default /mnt/<name>).
+    /// Mountpoint for a newly-registered disk (default /mnt/<name>). Stable and
+    /// location-independent — unchanged when the disk moves local↔remote.
     #[arg(long)]
     pub mountpoint: Option<PathBuf>,
     /// LUKS UUID for a newly-registered disk (default: read from its header).
@@ -492,6 +494,10 @@ pub enum RemoteAction {
     /// them first, so they aren't orphaned).
     #[command(alias = "rm", alias = "delete")]
     Remove(RemoteRemoveArgs),
+    /// Rename a remote's logical name, re-pointing every disk that lives on it.
+    /// Handy when a remote was first registered under an ad-hoc name (e.g. the SSH
+    /// user) and you want its real hostname instead.
+    Rename(RemoteRenameArgs),
     /// Enable remote(s): `up`/discovery consider their disks again. Reverses
     /// `disable`. Omit names to multi-select.
     Enable(RemoteToggleArgs),
@@ -541,6 +547,14 @@ pub struct RemoteToggleArgs {
     /// Name(s) of the [[remote]] entries to enable/disable. Omit to pick from a
     /// multi-select list in an interactive terminal.
     pub names: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct RemoteRenameArgs {
+    /// Current name of the [[remote]] to rename.
+    pub old: String,
+    /// New name. Must not already be in use by another remote.
+    pub new: String,
 }
 
 #[derive(Args, Debug)]

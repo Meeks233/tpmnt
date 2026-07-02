@@ -102,6 +102,16 @@ pub struct Disk {
     /// name (e.g. the distro's `luks-<uuid>` from crypttab).
     #[serde(default)]
     pub mapper: Option<String>,
+    /// Where the decrypted filesystem is mounted. This is a **stable, explicit**
+    /// path (default `/mnt/<name>`) that is deliberately *location-independent*:
+    /// tpmnt NEVER derives or rewrites it from whether the disk is local or
+    /// remote. A disk keeps the exact same mountpoint whether it lives here or is
+    /// forwarded from a remote — that stability is the whole point of the
+    /// location-transparency model (`discover`/`relocate` re-bind the *device*,
+    /// never the mountpoint). So don't read local/remote status into the path:
+    /// e.g. `/mnt/remote/foo` on a now-local disk is just an old hand-picked path,
+    /// not tpmnt reacting to anything. Set it explicitly at init/adopt time
+    /// (`--mountpoint`) if you don't want the `/mnt/<name>` default.
     pub mountpoint: PathBuf,
     #[serde(default = "default_fstype")]
     pub fstype: String,
