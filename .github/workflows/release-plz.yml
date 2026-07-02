@@ -1,0 +1,74 @@
+name: Release-plz
+
+# Automated version management. No more hand-derived version numbers or manual
+# `Cargo.toml` bumps: release-plz reads Conventional Commits (feat:/fix:/feat!:)
+# since the last release and maintains a rolling "Release PR" that bumps the
+# version + regenerates CHANGELOG.md.
+#
+# Flow:
+#   * push to master/main  -> `release-pr` job keeps the Release PR up to date.
+#   * merge the Release PR  -> `release` job runs `cargo publish` (crates.io) and
+#     pushes the `vX.Y.Z` git tag. That tag then triggers release.yml (deb/rpm +
+#     signed repos), which owns the GitHub Release itself (git_release_enable=false).
+#
+# One-time setup (see docs — CLAUDE.md "Distribution"):
+#   1. Settings > Actions > General > Workflow permissions:
+#      enable "Allow GitHub Actions to create and approve pull requests".
+#   2. Secret RELEASE_PLZ_TOKEN — a PAT with contents+pull-requests write. A PAT
+#      (not the default GITHUB_TOKEN) is required so the tag release-plz pushes can
+#      trigger release.yml (tags pushed by GITHUB_TOKEN don't start new workflows).
+#   3. Secret CARGO_REGISTRY_TOKEN — a crates.io token with publish-new + publish-update.
+on:
+  push:
+    branches: [master, main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # Publish on merge: cargo publish + push the vX.Y.Z tag (triggers release.yml).
+  # Guarded by the RELEASE_PLZ_ENABLE_PUBLISH repo variable — a publish kill-switch.
+  # It also gates the initial bootstrap: crates.io starts empty, so this job must
+  # stay off until Cargo.toml holds the intended first version, then be enabled.
+  release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    if: ${{ vars.RELEASE_PLZ_ENABLE_PUBLISH == 'true' }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: stable
+      - name: Run release-plz
+        uses: release-plz/action@975e932b313daccbd2db607a53c63c9c5300279b # v0.5.130
+        with:
+          command: release
+        env:
+          # PAT so the pushed vX.Y.Z tag triggers release.yml.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Maintain the Release PR (version bump + changelog) as commits land.
+  release-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: stable
+      - name: Run release-plz
+        uses: release-plz/action@975e932b313daccbd2db607a53c63c9c5300279b # v0.5.130
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
