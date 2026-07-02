@@ -57,6 +57,10 @@ struct Resolved {
     remote: Option<String>,
     name: String,
     mountpoint: PathBuf,
+    /// Whether the mountpoint was set explicitly (`--mountpoint`/from-config). When
+    /// false, the real default is filled in later — `/mnt/<name>-<uuid>` — once the
+    /// LUKS UUID exists, so same-named disks don't collide under /mnt.
+    mountpoint_explicit: bool,
     wipe: bool,
     no_partition: bool,
     partition: Option<String>,
@@ -87,7 +91,7 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
     if args.explain {
         return Ok(explain());
     }
-    let r = resolve(args)?;
+    let mut r = resolve(args)?;
     if r.local_plaintext && !args.i_understand_plaintext_keys {
         return err(
             Code::EBackupRefused,
@@ -241,6 +245,14 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
             .trim()
             .to_string()
     };
+
+    // Now that the UUID exists, fill in the default mountpoint as
+    // `/mnt/<name>-<uuid>` (unless the user set one explicitly), so two disks with
+    // the same name don't collide under /mnt. Skipped under dry-run, where the
+    // real UUID isn't known yet.
+    if !r.mountpoint_explicit && !dry {
+        r.mountpoint = crate::config::default_mountpoint(&r.name, &luks_uuid);
+    }
 
     // 6. AUTO-DECRYPT (TPM2) -------------------------------------------------
     // Skipped under dry-run: the partition does not exist yet, so the enroll
@@ -470,11 +482,11 @@ fn resolve(args: &InitArgs) -> Result<Resolved> {
         .or(spec.name)
         .unwrap_or_else(|| basename(&device));
 
-    let mountpoint = args
-        .mountpoint
-        .clone()
-        .or(spec.mountpoint)
-        .unwrap_or_else(|| PathBuf::from(format!("/mnt/{name}")));
+    // Placeholder default now; the real `/mnt/<name>-<uuid>` is filled in once the
+    // LUKS UUID exists (greenfield disks generate it during format).
+    let explicit_mp = args.mountpoint.clone().or(spec.mountpoint);
+    let mountpoint_explicit = explicit_mp.is_some();
+    let mountpoint = explicit_mp.unwrap_or_else(|| PathBuf::from(format!("/mnt/{name}")));
 
     let manual_passphrase = if args.passphrase_stdin {
         Some(read_stdin_line()?)
@@ -496,6 +508,7 @@ fn resolve(args: &InitArgs) -> Result<Resolved> {
         remote: args.remote.clone().or(spec.remote),
         name,
         mountpoint,
+        mountpoint_explicit,
         wipe: args.wipe || spec.wipe.unwrap_or(false),
         no_partition: args.no_partition || spec.no_partition.unwrap_or(false),
         partition: args.partition.clone().or(spec.partition),

@@ -490,7 +490,7 @@ fn register_new_disk(
     let mountpoint = args
         .mountpoint
         .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("/mnt/{name}")));
+        .unwrap_or_else(|| crate::config::default_mountpoint(name, &uuid));
 
     Ok(Disk {
         name: name.to_string(),

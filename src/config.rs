@@ -543,6 +543,30 @@ fn default_standby_timeout() -> String {
 fn default_true() -> bool {
     true
 }
+
+/// A short, stable tag derived from a LUKS UUID: the first 4 hex chars (dashes
+/// dropped, lowercased). Long enough to disambiguate a handful of same-named
+/// disks, short enough to stay readable in a path.
+pub fn short_uuid(uuid: &str) -> String {
+    uuid.chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(4)
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// The default mountpoint for a disk: `/mnt/<name>-<short-uuid>`. The UUID suffix
+/// keeps `/mnt` paths unique even when two disks share a logical name (the common
+/// "both called backup" collision), while staying short. Falls back to plain
+/// `/mnt/<name>` only when no usable UUID is available.
+pub fn default_mountpoint(name: &str, uuid: &str) -> PathBuf {
+    let tag = short_uuid(uuid);
+    if tag.is_empty() {
+        PathBuf::from(format!("/mnt/{name}"))
+    } else {
+        PathBuf::from(format!("/mnt/{name}-{tag}"))
+    }
+}
 /// Skip serializing a `true` flag so an enabled disk/remote stays absent from the
 /// TOML (only the notable `enabled = false` is ever written).
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
@@ -797,6 +821,24 @@ mountpoint = "/mnt/d"
         assert!(d.remote.is_none());
         assert!(cfg.remote_for(d).is_none());
         assert!(cfg.ssh_prefix_for(d).is_empty());
+    }
+
+    #[test]
+    fn default_mountpoint_appends_short_uuid_suffix() {
+        // Real UUID → /mnt/<name>-<first 4 hex>, dashes ignored, lowercased.
+        assert_eq!(
+            default_mountpoint("coldstore", "6467C043-69a6-414d-8034-7ac25ac77113"),
+            PathBuf::from("/mnt/coldstore-6467")
+        );
+        assert_eq!(short_uuid("6467c043-69a6"), "6467");
+        // Two same-named disks get distinct paths.
+        let a = default_mountpoint("backup", "aaaa1111-....");
+        let b = default_mountpoint("backup", "bbbb2222-....");
+        assert_ne!(a, b);
+        assert_eq!(a, PathBuf::from("/mnt/backup-aaaa"));
+        // No usable UUID → plain /mnt/<name>, never a dangling dash.
+        assert_eq!(default_mountpoint("x", ""), PathBuf::from("/mnt/x"));
+        assert_eq!(default_mountpoint("x", "----"), PathBuf::from("/mnt/x"));
     }
 
     #[test]
