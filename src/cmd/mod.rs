@@ -72,12 +72,13 @@ pub fn ensure_nbd_hidden(
 impl Context {
     pub fn new(global: GlobalOpts, config: Config) -> Self {
         let runner = Runner::new(global.effective_dry_run(), global.debug);
+        let env = EnvInfo::detect(&runner);
         Context {
             global,
             config,
             runner,
             paths: Paths::from_env(),
-            env: EnvInfo::detect(),
+            env,
         }
     }
 }

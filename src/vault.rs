@@ -98,7 +98,7 @@ pub fn load(runner: &Runner, dir: &Path, pin: &str) -> Result<Value> {
     }
     let sd = SecureDir::labeled("vault")?;
     let pin_file = sd.write_key("pin", pin)?;
-    let out = runner.probe(
+    let out = runner.probe_secret(
         &decrypt_argv(&pin_file.to_string_lossy(), &path.to_string_lossy())
             .iter()
             .map(String::as_str)
@@ -146,15 +146,21 @@ pub fn save(runner: &Runner, dir: &Path, value: &Value, pin: &str, dry: bool) ->
         )
     };
 
-    // gpg refuses to overwrite silently even with --yes on some versions; remove
-    // the old vault first so re-saves are clean.
-    if !dry && path.exists() {
-        let _ = std::fs::remove_file(&path);
-    }
+    // Encrypt to a sibling temp file, then atomically rename over the real vault,
+    // so a failed/interrupted gpg (ENOSPC, SIGTERM, power loss) never destroys the
+    // existing escrow — it holds every disk's LUKS passphrase + recovery key.
+    // (gpg won't overwrite via --output on some versions, so clear any stale temp.)
+    let tmp = if dry {
+        path.to_string_lossy().into_owned()
+    } else {
+        let t = format!("{}.new", path.to_string_lossy());
+        let _ = std::fs::remove_file(&t);
+        t
+    };
 
     runner
         .run(
-            &encrypt_argv(&pin_file, &plain_file, &path.to_string_lossy())
+            &encrypt_argv(&pin_file, &plain_file, &tmp)
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
@@ -164,7 +170,13 @@ pub fn save(runner: &Runner, dir: &Path, value: &Value, pin: &str, dry: bool) ->
 
     if !dry {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).ok();
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            Error::new(
+                Code::EEscrowFailed,
+                format!("finalize vault {}: {e}", path.display()),
+            )
+        })?;
     }
     Ok(path)
 }

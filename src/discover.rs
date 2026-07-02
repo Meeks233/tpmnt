@@ -97,7 +97,13 @@ fn parse_blkid_export(stdout: &str) -> Uuids {
     let mut uuid: Option<String> = None;
     let flush = |dev: &mut Option<String>, id: &mut Option<String>, map: &mut Uuids| {
         if let (Some(d), Some(u)) = (dev.take(), id.take()) {
-            map.insert(u, d);
+            // Skip /dev/nbdN: a live tpmnt forward exposes a *remote* disk's raw
+            // ciphertext locally with the container UUID, so counting it as a
+            // "local" home would make resolve() mis-classify a connected remote
+            // disk as local and strip its remote/transport binding.
+            if !d.starts_with("/dev/nbd") {
+                map.insert(u, d);
+            }
         }
     };
     for line in stdout.lines() {

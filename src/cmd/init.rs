@@ -136,15 +136,18 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
         .get("has_data")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    if has_data && !r.no_partition && r.partition.is_none() {
+    // Guard both the default (GPT-partition) path and --no-partition: each
+    // luksFormats the whole `op_device` that preflight just inspected, so
+    // `has_data` describes exactly what would be destroyed. Only an explicit
+    // --partition <devpart> targets something other than the inspected device,
+    // so it stays the deliberate escape hatch.
+    if has_data && r.partition.is_none() {
         if !r.wipe {
             return Err(Error::new(
                 Code::EDeviceHasData,
                 format!("{} already has partitions/data", r.device),
             )
-            .with_hint(
-                "pass --wipe --yes to destroy it, or --partition <devpart>/--no-partition",
-            ));
+            .with_hint("pass --wipe --yes to destroy it, or --partition <devpart>"));
         }
         if !ctx.global.yes {
             return Err(Error::new(

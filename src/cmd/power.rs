@@ -142,9 +142,20 @@ pub fn schedule(ctx: &Context, args: &ScheduleArgs) -> Result<Value> {
 
     loop {
         for d in &disks {
-            let tick = power::schedule_tick(ctx, d, tz)?;
-            if ctx.global.debug {
-                eprintln!("{tick}");
+            // A transient per-disk failure (e.g. a TPM2/cryptsetup hiccup during
+            // one disk's on-window) must not abort the daemon and starve the
+            // other scheduled disks; log and carry on to the next disk.
+            match power::schedule_tick(ctx, d, tz) {
+                Ok(tick) => {
+                    if ctx.global.debug {
+                        eprintln!("{tick}");
+                    }
+                }
+                Err(e) => {
+                    if ctx.global.debug {
+                        eprintln!("{}: {}", d.name, e.message);
+                    }
+                }
             }
         }
         sleep(Duration::from_secs(30));

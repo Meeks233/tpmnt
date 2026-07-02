@@ -21,9 +21,17 @@ pub struct LuksInfo {
     pub tokens: Vec<String>,
 }
 
+/// Whether a LUKS2 token type denotes a TPM-backed unlock. Besides systemd's own
+/// `systemd-tpm2`, `clevis` (Fedora/RHEL's `clevis luks bind`) also binds a
+/// keyslot to the TPM (or a network policy) with no human passphrase, so it must
+/// count as TPM-backed — otherwise a clevis slot is misread as a passphrase fallback.
+fn is_tpm_token(t: &str) -> bool {
+    t.contains("tpm2") || t == "clevis"
+}
+
 impl LuksInfo {
     pub fn has_tpm2_token(&self) -> bool {
-        self.tokens.iter().any(|t| t.contains("tpm2"))
+        self.tokens.iter().any(|t| is_tpm_token(t))
     }
 
     /// A passphrase/recovery keyslot count: total keyslots minus nothing,
@@ -32,9 +40,9 @@ impl LuksInfo {
     /// container with >=1 keyslot and (no token, or more keyslots than tokens)
     /// has a usable non-TPM fallback.
     pub fn has_non_tpm_fallback(&self) -> bool {
-        // Each systemd-tpm2 token references one keyslot. If keyslots exceed
-        // tpm2 tokens, at least one is a passphrase/recovery slot.
-        let tpm_tokens = self.tokens.iter().filter(|t| t.contains("tpm2")).count();
+        // Each TPM-backed token (systemd-tpm2 or clevis) references one keyslot.
+        // If keyslots exceed TPM tokens, at least one is a passphrase/recovery slot.
+        let tpm_tokens = self.tokens.iter().filter(|t| is_tpm_token(t)).count();
         self.keyslots.len() > tpm_tokens
     }
 }

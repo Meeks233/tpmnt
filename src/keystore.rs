@@ -38,8 +38,18 @@ impl SecureDir {
         } else {
             std::env::temp_dir()
         };
-        let path = base.join(format!("tpmnt-{label}-{}", std::process::id()));
-        std::fs::create_dir_all(&path)
+        // /dev/shm is world-writable+sticky (1777). A predictable name plus
+        // create_dir_all (which reuses an existing path and follows symlinks)
+        // would let a local attacker pre-plant a symlink and capture the
+        // cleartext keyfiles. Use an unpredictable name and *exclusive* create
+        // (create_dir fails with AlreadyExists rather than reusing/following),
+        // so we never write secrets into an attacker-controlled directory.
+        let path = base.join(format!(
+            "tpmnt-{label}-{}-{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        std::fs::create_dir(&path)
             .map_err(|e| Error::new(Code::EInternal, format!("mkdir securedir: {e}")))?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
             .map_err(|e| Error::new(Code::EInternal, format!("chmod securedir: {e}")))?;
@@ -61,6 +71,26 @@ impl Drop for SecureDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// 16 hex chars of kernel randomness for an unpredictable tmpfs dir name. Falls
+/// back to the high bits of a nanosecond clock if /dev/urandom is unreadable —
+/// combined with the exclusive create, an unlucky guess merely errors, never
+/// leaks. Linux-only, so /dev/urandom is always present in practice.
+fn rand_suffix() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 8];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_err()
+    {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        buf = (n as u64).to_le_bytes();
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The credential name embedded in the sealed blob (used as AAD by
@@ -119,7 +149,7 @@ pub fn seal(
 pub fn unseal(runner: &Runner, path: &Path, disk: &str) -> Result<String> {
     let name = cred_name(disk);
     let p = path.to_string_lossy().into_owned();
-    let out = runner.probe(
+    let out = runner.probe_secret(
         &[
             "systemd-creds",
             "decrypt",

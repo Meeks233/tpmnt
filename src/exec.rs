@@ -57,12 +57,20 @@ impl Runner {
     /// Run a read-only probe. Always executes even under --dry-run, because
     /// probes must reflect reality for planning to be meaningful.
     pub fn probe(&self, argv: &[&str], why: &str) -> Result<Output> {
-        self.run_inner(argv, why, false, &[], None)
+        self.run_inner(argv, why, false, &[], None, false)
+    }
+
+    /// Like `probe`, but the child's stdout is decrypted secret material (e.g. a
+    /// gpg/systemd-creds decrypt whose stdout is the plaintext vault). The stdout
+    /// is returned to the caller but redacted from the recorded trace, so it never
+    /// leaks into `--plan` output or `--debug` stderr. Also runs under --dry-run.
+    pub fn probe_secret(&self, argv: &[&str], why: &str) -> Result<Output> {
+        self.run_inner(argv, why, false, &[], None, true)
     }
 
     /// Run a state-mutating command. Skipped (but recorded) under --dry-run.
     pub fn run(&self, argv: &[&str], why: &str) -> Result<Output> {
-        self.run_inner(argv, why, true, &[], None)
+        self.run_inner(argv, why, true, &[], None, false)
     }
 
     /// Like `probe`, but runs `argv` on a remote by prepending `prefix` (an SSH
@@ -72,7 +80,7 @@ impl Runner {
     pub fn probe_on(&self, prefix: &[String], argv: &[&str], why: &str) -> Result<Output> {
         let wrapped = wrap(prefix, argv);
         let refs: Vec<&str> = wrapped.iter().map(String::as_str).collect();
-        self.run_inner(&refs, why, false, &[], None)
+        self.run_inner(&refs, why, false, &[], None, false)
     }
 
     /// Like `run`, but runs `argv` on a remote by prepending `prefix` (an SSH
@@ -82,19 +90,19 @@ impl Runner {
     pub fn run_on(&self, prefix: &[String], argv: &[&str], why: &str) -> Result<Output> {
         let wrapped = wrap(prefix, argv);
         let refs: Vec<&str> = wrapped.iter().map(String::as_str).collect();
-        self.run_inner(&refs, why, true, &[], None)
+        self.run_inner(&refs, why, true, &[], None, false)
     }
 
     /// Like `run`, but injects environment variables (e.g. `$PASSWORD` for
     /// systemd-cryptenroll). Env values are NOT recorded in the trace.
     pub fn run_env(&self, argv: &[&str], envs: &[(&str, &str)], why: &str) -> Result<Output> {
-        self.run_inner(argv, why, true, envs, None)
+        self.run_inner(argv, why, true, envs, None, false)
     }
 
     /// Like `run`, but feeds `stdin` to the child (e.g. a secret bundle to
     /// `age`/`gpg`). The stdin bytes are NOT recorded in the trace.
     pub fn run_stdin(&self, argv: &[&str], stdin: &[u8], why: &str) -> Result<Output> {
-        self.run_inner(argv, why, true, &[], Some(stdin))
+        self.run_inner(argv, why, true, &[], Some(stdin), false)
     }
 
     fn run_inner(
@@ -104,6 +112,7 @@ impl Runner {
         destructive: bool,
         envs: &[(&str, &str)],
         stdin: Option<&[u8]>,
+        secret: bool,
     ) -> Result<Output> {
         let argv_owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
 
@@ -148,7 +157,14 @@ impl Runner {
                     why: why.to_string(),
                     destructive,
                     exit: Some(status),
-                    stdout: Some(stdout.clone()),
+                    // Redact secret stdout (decrypted vault/bundle plaintext) so it
+                    // never reaches --plan output or --debug stderr; the plaintext
+                    // is still returned to the caller in `Output` below.
+                    stdout: if secret {
+                        Some("<redacted secret output>".to_string())
+                    } else {
+                        Some(stdout.clone())
+                    },
                     stderr: Some(stderr.clone()),
                     duration_ms: Some(elapsed),
                     skipped: false,
@@ -188,16 +204,28 @@ impl Runner {
 }
 
 /// Prepend a remote `prefix` (SSH argv) to a local `argv`. An empty prefix
-/// leaves the command untouched (local execution). The remote command is passed
-/// as a single trailing string so the remote shell re-parses it, matching how
-/// `ssh host cmd arg…` already collapses its trailing words.
+/// leaves the command untouched (local execution → straight to execve, no shell).
+/// For the remote case, `ssh host w1 w2 …` space-joins its trailing words into a
+/// single string that the remote LOGIN SHELL re-splits and metachar/glob-expands.
+/// So each command token must be POSIX single-quoted here, or a token containing a
+/// space (e.g. a mountpoint `/mnt/my disk`) would be mis-split — or worse, a shell
+/// metacharacter would be executed remotely. The SSH `prefix` itself (ssh + its
+/// options) is left untouched: it is consumed by the local ssh binary, not the
+/// remote shell. Callers therefore pass the remote command as plain argv (like the
+/// local path); they must NOT pre-quote.
 fn wrap(prefix: &[String], argv: &[&str]) -> Vec<String> {
     if prefix.is_empty() {
         return argv.iter().map(|s| s.to_string()).collect();
     }
     let mut out: Vec<String> = prefix.to_vec();
-    out.extend(argv.iter().map(|s| s.to_string()));
+    out.extend(argv.iter().map(|s| shell_quote(s)));
     out
+}
+
+/// POSIX single-quote a token so the remote login shell reproduces it verbatim:
+/// wrap in single quotes and rewrite each embedded `'` as `'\''`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Spawn `cmd` with a piped stdin, write `input`, and collect output.
@@ -252,17 +280,36 @@ mod tests {
     }
 
     #[test]
-    fn wrap_prepends_ssh_prefix() {
+    fn wrap_prepends_ssh_prefix_and_quotes_remote_tokens() {
         let prefix = vec!["ssh".to_string(), "alice@host".into()];
+        // The prefix is untouched; each remote command token is single-quoted so
+        // the remote login shell reproduces it verbatim.
         assert_eq!(
             wrap(&prefix, &["test", "-e", "/dev/mapper/m"]),
             vec![
                 "ssh".to_string(),
                 "alice@host".into(),
-                "test".into(),
-                "-e".into(),
-                "/dev/mapper/m".into()
+                "'test'".into(),
+                "'-e'".into(),
+                "'/dev/mapper/m'".into()
             ]
         );
+    }
+
+    #[test]
+    fn wrap_quotes_spaces_and_metacharacters_for_the_remote_shell() {
+        let prefix = vec!["ssh".to_string(), "h".into()];
+        // A path with a space stays one argument on the remote.
+        assert_eq!(
+            wrap(&prefix, &["umount", "/mnt/my disk"]),
+            vec![
+                "ssh".to_string(),
+                "h".into(),
+                "'umount'".into(),
+                "'/mnt/my disk'".into()
+            ]
+        );
+        // An embedded single quote is escaped as '\'' so nothing breaks out.
+        assert_eq!(super::shell_quote("a'b"), "'a'\\''b'");
     }
 }

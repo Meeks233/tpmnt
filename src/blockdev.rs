@@ -183,6 +183,21 @@ pub fn free_nbd_device() -> String {
     "/dev/nbd0".into()
 }
 
+/// Pick a free local port at or above `base`, skipping any whose ControlMaster
+/// socket already exists — i.e. one carrying a live forward from a prior invocation.
+/// Forwards persist across invocations, so every `connect` starting again from the
+/// fixed default would otherwise collide with an already-established tunnel and its
+/// bound port. Falls back to `base` when nothing free is found in the scan window.
+fn free_local_port(base: u16) -> u16 {
+    for off in 0..16 {
+        let port = base.saturating_add(off);
+        if !std::path::Path::new(&control_path(port)).exists() {
+            return port;
+        }
+    }
+    base
+}
+
 /// Forward a remote disk's ciphertext here over NBD-over-SSH and return the local
 /// block device. A persistent background ControlMaster tunnel carries the link;
 /// `sudo qemu-nbd --fork` serves the raw blocks on the remote loopback; we attach
@@ -194,6 +209,9 @@ pub fn attach_nbd_over_ssh(
     ciphertext_dev: &str,
     local_port: u16,
 ) -> Result<Attachment> {
+    // The caller passes a base port; resolve it to one not already held by a live
+    // forward so bringing up a second disk in a new invocation doesn't collide.
+    let local_port = free_local_port(local_port);
     let local_dev = free_nbd_device();
     let prefix = remote.ssh_prefix();
     let ctl = control_path(local_port);

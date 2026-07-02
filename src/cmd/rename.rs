@@ -64,13 +64,16 @@ pub fn run(ctx: &Context, args: &RenameArgs) -> Result<Value> {
     let old_mp = old.mountpoint.clone();
 
     // Compute the renamed disk. The mapper follows the name unless it was pinned
-    // to a custom value; a DEFAULT mountpoint (/mnt/<old>) moves to /mnt/<new>,
-    // while a custom mountpoint is preserved.
+    // to a custom value; a DEFAULT mountpoint moves to the new name's default,
+    // while a custom mountpoint is preserved. The current default convention is
+    // /mnt/<name>-<short-uuid> (config::default_mountpoint); we also match the
+    // legacy bare /mnt/<name> form for disks created before the UUID suffix.
     let mut new = old.clone();
     new.name = args.new.clone();
-    let default_mp = PathBuf::from(format!("/mnt/{}", args.old));
-    if old.mountpoint == default_mp {
-        new.mountpoint = PathBuf::from(format!("/mnt/{}", args.new));
+    let default_mp = crate::config::default_mountpoint(&args.old, &old.uuid);
+    let legacy_mp = PathBuf::from(format!("/mnt/{}", args.old));
+    if old.mountpoint == default_mp || old.mountpoint == legacy_mp {
+        new.mountpoint = crate::config::default_mountpoint(&args.new, &old.uuid);
     }
     let new_mapper = new.mapper_name();
     let new_mp = new.mountpoint.clone();

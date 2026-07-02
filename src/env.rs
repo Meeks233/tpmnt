@@ -5,6 +5,8 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::exec::Runner;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EnvInfo {
     /// This machine's own hostname — titles the "self" box in the dashboard,
@@ -31,11 +33,11 @@ pub enum Initramfs {
 }
 
 impl EnvInfo {
-    pub fn detect() -> EnvInfo {
+    pub fn detect(runner: &Runner) -> EnvInfo {
         EnvInfo {
             hostname: detect_hostname(),
             distro_id: detect_distro(),
-            systemd_version: detect_systemd_version(),
+            systemd_version: detect_systemd_version(runner),
             tpm_rm_present: Path::new("/dev/tpmrm0").exists(),
             tpm_path: tpm_path(),
             initramfs: detect_initramfs(),
@@ -83,12 +85,13 @@ fn detect_distro() -> String {
     "unknown".to_string()
 }
 
-fn detect_systemd_version() -> Option<u32> {
-    let out = std::process::Command::new("systemctl")
-        .arg("--version")
-        .output()
+fn detect_systemd_version(runner: &Runner) -> Option<u32> {
+    // Route through the Runner (not a raw Command) so this read-only probe is
+    // recorded in the --plan/--debug trace like every other shell-out.
+    let out = runner
+        .probe(&["systemctl", "--version"], "detect systemd version")
         .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout);
+    let s = out.stdout;
     // First line looks like: "systemd 255 (255.4-1)"
     let first = s.lines().next()?;
     let token = first.split_whitespace().nth(1)?;

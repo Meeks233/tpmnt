@@ -82,7 +82,10 @@ pub fn parse_selection(input: &str, n: usize) -> Vec<usize> {
         }
         if let Some((lo, hi)) = tok.split_once('-') {
             if let (Ok(lo), Ok(hi)) = (lo.trim().parse::<usize>(), hi.trim().parse::<usize>()) {
-                for k in lo..=hi {
+                // Clamp the upper bound so a huge `hi` (e.g. `1-99999999999`) can't spin
+                // the loop for billions of iterations; out-of-range indices were already
+                // dropped by `push`, so behavior for valid input is unchanged.
+                for k in lo..=hi.min(n) {
                     push(k, &mut out);
                 }
                 continue;
@@ -140,6 +143,13 @@ mod tests {
         assert_eq!(parse_selection("1 3-4", 5), vec![0, 2, 3]);
         // Reversed range yields nothing (lo>hi), not a panic.
         assert_eq!(parse_selection("4-2", 5), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn parse_huge_upper_bound_is_clamped_not_a_hang() {
+        // A giant `hi` must be clamped to `n`, not iterated billions of times.
+        assert_eq!(parse_selection("1-99999999999", 3), vec![0, 1, 2]);
+        assert_eq!(parse_selection("2-18446744073709551615", 3), vec![1, 2]);
     }
 
     #[test]

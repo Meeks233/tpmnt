@@ -63,10 +63,14 @@ fn upsert_tagged_line(
             std::fs::create_dir_all(parent)
                 .map_err(|e| Error::new(Code::EInternal, format!("mkdir: {e}")))?;
         }
-        // Back up once before mutating.
+        // Back up the pristine file once. Guard on `!bak.exists()` so that a
+        // multi-disk apply (several disks reconciling the same crypttab/fstab in
+        // one run) doesn't overwrite the original backup with an already-edited copy.
         if path.exists() {
             let bak = path.with_extension("bak");
-            let _ = std::fs::copy(path, bak);
+            if !bak.exists() {
+                let _ = std::fs::copy(path, bak);
+            }
         }
         let mut content = out_lines.join("\n");
         content.push('\n');
@@ -173,13 +177,24 @@ pub fn reconcile_disk(
     Ok(changes)
 }
 
-/// systemd .mount unit name is derived from the mountpoint path.
+/// systemd .mount unit name is derived from the mountpoint path. This mirrors
+/// `systemd-escape -p`: `/` becomes `-`, and every byte outside `[A-Za-z0-9_.]`
+/// (including a literal `-` and a leading `.`) is escaped as `\xNN`. systemd
+/// refuses to load a `.mount` unit whose filename doesn't equal the escaped
+/// `Where=` path, so escaping only `-`/`/` (as before) breaks any mountpoint
+/// containing spaces or other special characters.
 pub fn unit_name_for(mountpoint: &Path) -> String {
-    let escaped = mountpoint
-        .to_string_lossy()
-        .trim_matches('/')
-        .replace('-', "\\x2d")
-        .replace('/', "-");
+    let trimmed = mountpoint.to_string_lossy();
+    let trimmed = trimmed.trim_matches('/');
+    let mut escaped = String::with_capacity(trimmed.len());
+    for (i, b) in trimmed.bytes().enumerate() {
+        match b {
+            b'/' => escaped.push('-'),
+            b'.' if i == 0 => escaped.push_str("\\x2e"),
+            b'_' | b'.' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' => escaped.push(b as char),
+            _ => escaped.push_str(&format!("\\x{b:02x}")),
+        }
+    }
     format!("{escaped}.mount")
 }
 
@@ -276,7 +291,9 @@ pub fn remove_tagged_line(path: &Path, name: &str, dry_run: bool) -> Result<File
         .collect();
     if removed && !dry_run {
         let bak = path.with_extension("bak");
-        let _ = std::fs::copy(path, bak);
+        if !bak.exists() {
+            let _ = std::fs::copy(path, bak);
+        }
         let mut content = kept.join("\n");
         if !content.is_empty() {
             content.push('\n');
@@ -296,6 +313,23 @@ mod tests {
     use super::*;
     use crate::config::Disk;
     use std::path::PathBuf;
+
+    #[test]
+    fn unit_name_escapes_like_systemd_escape_p() {
+        // Plain path: only `/` -> `-`.
+        assert_eq!(unit_name_for(&PathBuf::from("/mnt/data")), "mnt-data.mount");
+        // A literal `-` must be escaped so it isn't confused with the separator.
+        assert_eq!(
+            unit_name_for(&PathBuf::from("/mnt/my-disk")),
+            "mnt-my\\x2ddisk.mount"
+        );
+        // A space (and any char outside [A-Za-z0-9_.]) becomes \xNN, matching
+        // `systemd-escape -p`, so systemd accepts the unit name.
+        assert_eq!(
+            unit_name_for(&PathBuf::from("/mnt/My Backup")),
+            "mnt-My\\x20Backup.mount"
+        );
+    }
 
     fn disk() -> Disk {
         Disk {

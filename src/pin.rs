@@ -13,9 +13,14 @@ use std::path::Path;
 
 use crate::error::{err, Code, Result};
 
-/// Minimum PIN length. A short PIN under a memory-hard KDF is still weak; refuse
-/// obviously-guessable ones up front so a typo doesn't become a weak vault.
-const MIN_PIN_LEN: usize = 4;
+/// Minimum PIN length. The PIN both unlocks the TPM and (via gpg --symmetric)
+/// encrypts the recovery vault, which holds every disk's LUKS passphrase +
+/// recovery key. Since the vault ciphertext is portable escrow that may leave
+/// the host, its security is bounded by PIN entropy: a 4-digit PIN is offline-
+/// brute-forceable in minutes despite the iterated s2k. Require >= 8 so the
+/// keyspace is not trivially exhaustible. (A PIN is opt-in; the default unlock
+/// path is TPM-only auto-decrypt with no PIN to type.)
+const MIN_PIN_LEN: usize = 8;
 
 /// Resolve the PIN from `--pin-file`, `$TPMNT_PIN`, or an interactive prompt.
 /// Trailing newlines are stripped so a file written with `echo` still matches the
@@ -108,8 +113,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("pin");
         let mut fh = std::fs::File::create(&f).unwrap();
-        writeln!(fh, "hunter2").unwrap();
-        assert_eq!(resolve(Some(&f), true).unwrap(), "hunter2");
+        writeln!(fh, "hunter22").unwrap();
+        assert_eq!(resolve(Some(&f), true).unwrap(), "hunter22");
         std::fs::remove_dir_all(&dir).ok();
     }
 

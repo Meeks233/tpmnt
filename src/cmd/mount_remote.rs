@@ -674,14 +674,19 @@ fn is_mountpoint(path: &str) -> bool {
 
 /// Whether an existing mount at `path` is our sshfs to the same host (idempotency).
 fn mount_source_matches(path: &str, rm: &RemoteMount) -> bool {
+    // The /proc/mounts source field is the string sshfs was given, which
+    // build_sshfs_argv constructs as `{hostonly}:{remote_path}` with the port
+    // moved into `-o port=`. Compare against that (not the raw `rm.host`, which
+    // may carry a `:port` suffix that never appears in the source).
+    let (hostonly, _) = split_host_port(&rm.host);
+    let expected = format!("{}:{}", hostonly, rm.remote_path);
     std::fs::read_to_string("/proc/mounts")
         .map(|s| {
             s.lines().any(|l| {
                 let mut it = l.split_whitespace();
                 let src = it.next().unwrap_or("");
                 let mp = it.next().unwrap_or("");
-                mp == path
-                    && (src.contains(&rm.host) || src.contains("fuse.sshfs") || src == rm.host)
+                mp == path && (src == expected || src.starts_with(&format!("{hostonly}:")))
             })
         })
         .unwrap_or(false)

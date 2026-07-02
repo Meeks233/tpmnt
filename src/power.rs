@@ -449,10 +449,9 @@ fn nbd_port_for(ctx: &Context, prefix: &[String], remote_dev: &str) -> Option<u1
 
 /// Run `echo <val> > <path>` as root on the disk's host (local or remote). The
 /// `>` redirect needs a shell. Locally tpmnt is already root, so `sh -c` runs it
-/// directly. Remotely the command is flattened by ssh and re-parsed by the
-/// host's login shell, so the inner command is single-quoted to survive that
-/// pass — otherwise the login shell (not root's `sh`) would perform the redirect
-/// and be denied, and glob metacharacters would be expanded there.
+/// directly. Remotely we pass `sudo -n sh -c <inner>` as plain argv; `Runner`'s
+/// remote `wrap` single-quotes each token (including `inner`), so the redirect
+/// happens inside root's `sh` — not the login shell — with no glob expansion.
 fn sysfs_write(ctx: &Context, prefix: &[String], path: &str, val: &str, why: &str) -> Result<()> {
     let inner = format!("echo {val} > {path}");
     if prefix.is_empty() {
@@ -460,9 +459,8 @@ fn sysfs_write(ctx: &Context, prefix: &[String], path: &str, val: &str, why: &st
             .run(&["sh", "-c", &inner], why)?
             .require("sysfs write")?;
     } else {
-        let quoted = format!("'{inner}'");
         ctx.runner
-            .run_on(prefix, &["sudo", "-n", "sh", "-c", &quoted], why)?
+            .run_on(prefix, &["sudo", "-n", "sh", "-c", &inner], why)?
             .require("sysfs write")?;
     }
     Ok(())
@@ -1266,9 +1264,12 @@ pub fn monitor_tick(ctx: &Context, disk: &Disk) -> Result<Value> {
                     },
                 );
             }
-            // First time we see this disk open this session: claim sole spindown
-            // authority + disable aggressive firmware APM head-parking.
-            let tune = first_obs.then(|| tune_spindown_authority(ctx, disk));
+            // Claim sole spindown authority + disable aggressive firmware APM
+            // head-parking. APM/standby settings reset across a standby cycle
+            // (see tune_spindown_authority), and a transparent wake from parked
+            // state never goes through spinup(), so re-tune not only on the first
+            // observation but also whenever the disk was previously parked.
+            let tune = (first_obs || already).then(|| tune_spindown_authority(ctx, disk));
             Ok(json!({
                 "ok": true, "action": "keep", "name": disk.name,
                 "io_counter": counter, "idle_secs": 0,
