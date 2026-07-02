@@ -1,0 +1,21 @@
+Package: tpmnt
+Version: 0.3.2-1
+Architecture: amd64
+Homepage: https://github.com/Meeks233/tpmnt
+Maintainer: tpmnt maintainers
+Installed-Size: 2999
+Depends: btrfs-progs, cryptsetup, gdisk, gnupg, hdparm, libc6 (>= 2.39), sudo, systemd, util-linux
+Recommends: sg3-utils, xfsprogs, e2fsprogs, parted, procps, openssh-client, sshfs, fuse3, nbd-client, udisks2, dmsetup, age
+Suggests: qemu-utils, nvme-cli
+Priority: optional
+Section: admin
+Filename: pool/main/t/tpmnt/tpmnt_0.3.2-1_amd64.deb
+Size: 1019872
+SHA256: 15dd6f50592796819b712d1dc293c27ff93fde1f0db0f71a1d2356c83d1cb95d
+SHA1: e870a08b5ca137a46af18b08a9c35cb4eaf5afea
+MD5sum: 62f2328447a715bf0bc89ba246687260
+Description: Unified, declarative, AI-native CLI for LUKS2 + TPM2 enroll-once auto-decrypt
+ and auto-mount
+ tpmnt unifies LUKS2 + TPM2 enrollment, declarative crypttab/fstab/systemd mount
+ reconciliation, key escrow, and remote sshfs mounts into one AI-native CLI.
+

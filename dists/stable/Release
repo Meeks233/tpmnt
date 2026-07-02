@@ -1,0 +1,29 @@
+Origin: tpmnt
+Label: tpmnt
+Suite: stable
+Codename: stable
+Date: Thu, 02 Jul 2026 09:27:52 UTC
+Architectures: amd64 arm64
+Components: main
+Description: tpmnt stable apt repository
+MD5Sum:
+ 99aa81e0b8703bce05c2ad270d45191d 928 main/binary-amd64/Packages
+ c144a49c3513e994f04f7da9ef3e4b65 607 main/binary-amd64/Packages.gz
+ 7770210900479f52505d8f2401037aca 120 main/binary-amd64/Release
+ a9f589ef09dd7f32fcf478c54ac915ff 933 main/binary-arm64/Packages
+ 5c977c9b58e797e7809bc9ea04f12db2 608 main/binary-arm64/Packages.gz
+ c216f62d3117d9ea8194436c8f4acbbd 120 main/binary-arm64/Release
+SHA1:
+ 18558e67a5d43eef6000ee9cef781fefc2174219 928 main/binary-amd64/Packages
+ 333919be15669e131dab850be2ecd9a50441bbd8 607 main/binary-amd64/Packages.gz
+ 8c5b25ff0d828b03b8bd434a05188b44f9311865 120 main/binary-amd64/Release
+ 0052fc5f9dd4d414288e7547c11c3144fab5fa47 933 main/binary-arm64/Packages
+ e5476e01b37337a28f0011f61f34fdec78d9b2bf 608 main/binary-arm64/Packages.gz
+ cfed2d14510b76fd6ee1556332954707f69dff8f 120 main/binary-arm64/Release
+SHA256:
+ 401d870932642c06eb60ea1abe15e24f7a90decc89f358ade23ec77c670f489b 928 main/binary-amd64/Packages
+ b6852dedd6a532df432bb162e17b9634cb1b15e2f104b988ad907a9dd7905cbd 607 main/binary-amd64/Packages.gz
+ e2164b5eeb4021770bf7a90f4f22d2bf8eb1f8ec782d1827e372a41fe951671e 120 main/binary-amd64/Release
+ a589b35e5ec820bb4729cc5e020fa1bb3f23c23f07f969c3b8f422240d4a8bf4 933 main/binary-arm64/Packages
+ 1cede55c2ee2400f0429498d62ff86a20eae6ff03fc2c0d883c48a5df6b905df 608 main/binary-arm64/Packages.gz
+ b23a1217451e3c5b46e9cc9ab20aec5741f168822821afde72ac6516bd2b5dee 120 main/binary-arm64/Release

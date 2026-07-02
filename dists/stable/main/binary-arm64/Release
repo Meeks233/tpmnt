@@ -1,0 +1,6 @@
+Archive: stable
+Component: main
+Origin: tpmnt
+Label: tpmnt
+Architecture: arm64
+Description: tpmnt stable apt repository

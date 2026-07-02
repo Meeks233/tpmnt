@@ -1,0 +1,7 @@
+[tpmnt]
+name=tpmnt
+baseurl=https://meeks233.github.io/tpmnt/rpm
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://meeks233.github.io/tpmnt/gpg.key
