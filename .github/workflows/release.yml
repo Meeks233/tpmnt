@@ -157,3 +157,153 @@ jobs:
           make_latest: ${{ needs.channel.outputs.prerelease == 'false' }}
           # Replace assets each run so the rolling `edge` release stays clean.
           files: dist/**
+
+  # Software-source publishing — turns the loose .deb/.rpm assets into signed apt
+  # and dnf/zypper repositories served from GitHub Pages, so users can:
+  #   apt install tpmnt   /   dnf install tpmnt
+  #
+  # STABLE ONLY: the `edge` rolling channel is intentionally NOT published here —
+  # it stays in the GitHub Release assets so it can never pollute the stable repo.
+  # The repo is rebuilt from scratch every release (few packages → full rebuild is
+  # simplest and idempotent) and force-pushed to the orphan `gh-pages` branch.
+  #
+  # Requires two repo secrets (see docs/packaging.md):
+  #   GPG_PRIVATE_KEY  — armored OR base64-of-armored private (sub)key for signing
+  #   GPG_PASSPHRASE   — its passphrase (empty string if the key has none)
+  pages:
+    needs: [channel, deb, rpm]
+    if: ${{ needs.channel.outputs.prerelease == 'false' && needs.deb.result == 'success' && needs.rpm.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install repo tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y reprepro createrepo-c rpm gnupg
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Everything that needs the signing key lives in ONE step so the gpg-agent
+      # (and its preset passphrase cache) stays alive across apt + rpm signing.
+      - name: Build signed apt + rpm repositories
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          BASE_URL: https://meeks233.github.io/tpmnt
+          TAG: ${{ needs.channel.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # --- isolated, throwaway keyring -----------------------------------
+          GNUPGHOME="$(mktemp -d)"
+          export GNUPGHOME
+          chmod 700 "$GNUPGHOME"
+          cat > "$GNUPGHOME/gpg-agent.conf" <<'EOF'
+          allow-preset-passphrase
+          default-cache-ttl 7200
+          max-cache-ttl 7200
+          EOF
+          gpgconf --kill gpg-agent >/dev/null 2>&1 || true
+
+          # Secret may be stored armored or base64-of-armored; accept either.
+          if ! printf '%s' "$GPG_PRIVATE_KEY" | base64 -d 2>/dev/null | gpg --batch --import 2>/dev/null; then
+            printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          fi
+          KEYID="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')"
+          echo "Signing with key $KEYID"
+
+          # Preset the passphrase into the agent for every secret keygrip so both
+          # reprepro (via gpgme) and rpm can sign without an interactive pinentry.
+          PRESET="$(find /usr/lib /usr/libexec -name gpg-preset-passphrase 2>/dev/null | head -1)"
+          gpg --batch --list-secret-keys --with-keygrip --with-colons \
+            | awk -F: '/^grp:/{print $10}' \
+            | while read -r grip; do
+                "$PRESET" --preset --passphrase "$GPG_PASSPHRASE" "$grip"
+              done
+
+          # --- APT repository (reprepro) -------------------------------------
+          mkdir -p apt/conf
+          cat > apt/conf/distributions <<EOF
+          Origin: tpmnt
+          Label: tpmnt
+          Codename: stable
+          Suite: stable
+          Components: main
+          Architectures: amd64 arm64
+          Description: tpmnt stable apt repository
+          SignWith: $KEYID
+          EOF
+          for deb in dist/*.deb; do
+            echo "apt: including $deb"
+            reprepro -b apt includedeb stable "$deb"
+          done
+
+          # --- RPM repository (createrepo_c) ---------------------------------
+          # rpm --addsign uses the agent (passphrase already cached); no loopback.
+          cat > "$HOME/.rpmmacros" <<EOF
+          %_gpg_name $KEYID
+          %__gpg_sign_cmd %{__gpg} gpg --batch --no-verbose --no-armor --no-secmem-warning -u "%{_gpg_name}" -sbo %{__signature_filename} --digest-algo sha256 %{__plaintext_filename}
+          EOF
+          mkdir -p rpm
+          cp dist/*.rpm rpm/
+          for r in rpm/*.rpm; do
+            echo "rpm: signing $r"
+            rpm --addsign "$r"
+          done
+          createrepo_c rpm
+          # Detached, armored signature of repomd.xml for repo_gpgcheck=1.
+          gpg --batch --yes --detach-sign --armor \
+            -u "$KEYID" -o rpm/repodata/repomd.xml.asc rpm/repodata/repomd.xml
+
+          # --- assemble the Pages site ---------------------------------------
+          # apt lives at the site root (dists/ + pool/); rpm under /rpm.
+          mkdir -p site
+          cp -r apt/dists site/dists
+          cp -r apt/pool  site/pool
+          cp -r rpm        site/rpm
+          gpg --armor --export "$KEYID" > site/gpg.key
+          touch site/.nojekyll   # keep underscore/dot paths that Jekyll would strip
+
+          cat > site/tpmnt.repo <<EOF
+          [tpmnt]
+          name=tpmnt
+          baseurl=$BASE_URL/rpm
+          enabled=1
+          gpgcheck=1
+          repo_gpgcheck=1
+          gpgkey=$BASE_URL/gpg.key
+          EOF
+
+          cat > site/index.html <<EOF
+          <!doctype html><meta charset="utf-8"><title>tpmnt package repository</title>
+          <h1>tpmnt package repository</h1>
+          <p>Signed apt &amp; dnf/zypper repositories for <a href="https://github.com/Meeks233/tpmnt">tpmnt</a> (stable channel, built from tag <code>$TAG</code>).</p>
+          <h2>Debian / Ubuntu (apt)</h2>
+          <pre>curl -fsSL $BASE_URL/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/tpmnt.gpg
+          echo "deb [signed-by=/usr/share/keyrings/tpmnt.gpg] $BASE_URL stable main" | sudo tee /etc/apt/sources.list.d/tpmnt.list
+          sudo apt update &amp;&amp; sudo apt install tpmnt</pre>
+          <h2>Fedora / openSUSE (dnf/zypper)</h2>
+          <pre>sudo dnf config-manager --add-repo $BASE_URL/tpmnt.repo
+          sudo dnf install tpmnt</pre>
+          EOF
+
+          # Don't leak any key material into the published tree.
+          rm -rf "$GNUPGHOME"
+
+      - name: Deploy to gh-pages (full rebuild, force-push)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.channel.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd site
+          git init -q
+          git checkout -q -b gh-pages
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Publish tpmnt repository for $TAG"
+          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git" gh-pages

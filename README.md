@@ -32,6 +32,27 @@ gnupg, …), so it installs as a proper **`.deb` / `.rpm`** that pulls those too
 — nothing to wire up by hand. Every stable `v*` tag attaches packages for `x86_64` and `aarch64`;
 each push also refreshes a rolling [`edge` pre-release](https://github.com/Meeks233/tpmnt/releases/tag/edge).
 
+### Package repository (apt / dnf) — easiest
+
+Signed apt and dnf/zypper repositories are hosted on GitHub Pages (stable channel,
+`amd64` + `arm64`). Add the source once, then update through your package manager.
+
+**Debian / Ubuntu:**
+
+```sh
+curl -fsSL https://meeks233.github.io/tpmnt/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/tpmnt.gpg
+echo "deb [signed-by=/usr/share/keyrings/tpmnt.gpg] https://meeks233.github.io/tpmnt stable main" | sudo tee /etc/apt/sources.list.d/tpmnt.list
+sudo apt update && sudo apt install tpmnt
+```
+
+**Fedora / RHEL / openSUSE:**
+
+```sh
+sudo dnf config-manager --add-repo https://meeks233.github.io/tpmnt/tpmnt.repo
+sudo dnf install tpmnt
+# openSUSE: sudo zypper addrepo https://meeks233.github.io/tpmnt/tpmnt.repo && sudo zypper install tpmnt
+```
+
 ### Debian / Ubuntu (.deb) — recommended
 
 ```sh
