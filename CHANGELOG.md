@@ -4,6 +4,16 @@ All notable changes to tpmnt are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-07-02
+
+### Added
+
+- **Signed apt & dnf/zypper software repositories on GitHub Pages.** Stable `v*` releases now
+  publish signed `reprepro` (apt) and `createrepo_c` (rpm) repositories to a `gh-pages` branch,
+  so users can add a source once and `apt install tpmnt` / `dnf install tpmnt`. GPG signing runs
+  in CI from repo secrets. See `docs/packaging.md` for maintainer setup and the README for install
+  instructions. The rolling `edge` channel stays in Release assets and is not published to the repo.
+
 ## [0.3.0] - 2026-07-01
 
 ### Added
