@@ -301,6 +301,7 @@ mod tests {
         Disk {
             name: "data".into(),
             uuid: "1111".into(),
+            enabled: true,
             device: None,
             mapper: None,
             mountpoint: PathBuf::from("/mnt/data"),

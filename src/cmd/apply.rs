@@ -33,6 +33,17 @@ pub fn run(ctx: &Context) -> Result<Value> {
         .count();
 
     for disk in &cfg.disks {
+        // A disabled disk is dormant: `disable` already stripped its crypttab/units
+        // so it won't auto-unlock. Skip it here rather than re-adding them.
+        if !disk.enabled {
+            disks_out.push(json!({
+                "name": disk.name,
+                "skipped": "disabled",
+                "mountpoint": disk.mountpoint,
+            }));
+            continue;
+        }
+
         let device = disk.device_path();
         let mut disk_warnings: Vec<String> = Vec::new();
         let mut token_action = "unchanged";

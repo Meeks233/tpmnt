@@ -328,6 +328,7 @@ mod tests {
     fn nas() -> Remote {
         Remote {
             name: "nas".into(),
+            enabled: true,
             host: "alice@10.0.0.5:2222".into(),
             jump: vec!["gw@bastion".into()],
             identity: Some("/k/id".into()),

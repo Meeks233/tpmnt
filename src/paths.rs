@@ -65,4 +65,18 @@ impl Paths {
         self.at("var/lib/tpmnt/forward")
             .join(format!("{name}.json"))
     }
+
+    /// Per-remote runtime state (last-connected epoch + consecutive reconnect
+    /// give-ups) — not declarative config, so it lives under the runtime state
+    /// tree. Orders the dashboard's source boxes most-recently-connected first.
+    pub fn remote_state(&self, name: &str) -> PathBuf {
+        self.at("var/lib/tpmnt/remote").join(format!("{name}.json"))
+    }
+
+    /// Per-disk connect state (consecutive reconnect give-ups) used to auto-disable
+    /// a disk that keeps failing to come online.
+    pub fn disk_state(&self, name: &str) -> PathBuf {
+        self.at("var/lib/tpmnt/connect")
+            .join(format!("{name}.json"))
+    }
 }

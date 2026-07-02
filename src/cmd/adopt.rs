@@ -495,6 +495,7 @@ fn register_new_disk(
     Ok(Disk {
         name: name.to_string(),
         uuid,
+        enabled: true,
         // A LOCAL disk resolves via the stable /dev/disk/by-uuid/<uuid> symlink, so
         // it survives re-enumeration (sda↔sdb↔sdc). Only a REMOTE disk stores a
         // device path — there it names the disk on the *remote* host.

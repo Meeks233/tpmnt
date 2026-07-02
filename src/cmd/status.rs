@@ -116,6 +116,7 @@ pub fn run(ctx: &Context) -> Result<Value> {
 
         rows.push(json!({
             "name": disk.name,
+            "enabled": disk.enabled,
             "remote": disk.remote,
             "transport": disk.transport.map(|t| t.as_str()),
             "management": mgmt,
@@ -141,9 +142,34 @@ pub fn run(ctx: &Context) -> Result<Value> {
         }));
     }
 
+    // Per-remote metadata for the dashboard's source grouping: the machines that
+    // actually hold configured disks, each with the epoch tpmnt last connected it
+    // (so the dashboard can order them most-recently-connected first).
+    let remotes: Vec<Value> = ctx
+        .config
+        .remotes
+        .iter()
+        .filter(|r| {
+            ctx.config
+                .disks
+                .iter()
+                .any(|d| d.remote.as_deref() == Some(r.name.as_str()))
+        })
+        .map(|r| {
+            json!({
+                "name": r.name,
+                "enabled": r.enabled,
+                "host": r.host,
+                "last_connected": crate::remote_state::last_connected(&ctx.paths, &r.name),
+            })
+        })
+        .collect();
+
     Ok(json!({
         "ok": true,
         "env": ctx.env,
+        "now": crate::remote_state::now_secs(),
+        "remotes": remotes,
         "disks": rows,
     }))
 }
@@ -257,6 +283,7 @@ const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
 const GREY: &str = "\x1b[90m";
+const BOLD_CYAN: &str = "\x1b[1m\x1b[36m";
 
 /// Visible content width inside each panel (between the side borders + padding).
 /// Wide enough for a full `device   /dev/disk/by-uuid/<uuid>` line.
@@ -335,9 +362,6 @@ fn b(v: &Value, k: &str) -> bool {
 fn s<'a>(v: &'a Value, k: &str) -> &'a str {
     v.get(k).and_then(|x| x.as_str()).unwrap_or("?")
 }
-fn u(v: &Value, k: &str) -> u64 {
-    v.get(k).and_then(|x| x.as_u64()).unwrap_or(0)
-}
 
 /// Top border carrying the panel title; width matches `Row::finish`.
 fn panel_top(title_plain: &str, title_painted: &str) -> String {
@@ -348,18 +372,105 @@ fn panel_bottom() -> String {
     format!("└{}┘\n", "─".repeat(C + 2))
 }
 
-/// Format an idle window in seconds back to a compact human string.
-fn fmt_idle(secs: u64) -> String {
-    if secs >= 3600 && secs.is_multiple_of(3600) {
-        format!("{}h", secs / 3600)
-    } else if secs >= 60 && secs.is_multiple_of(60) {
-        format!("{}min", secs / 60)
+/// Format an elapsed span (now − then, both unix seconds) as a compact "ago"
+/// string. Returns `None` when either timestamp is missing so the caller can
+/// omit the annotation entirely.
+fn fmt_ago(now: Option<u64>, then: Option<u64>) -> Option<String> {
+    let (now, then) = (now?, then?);
+    let d = now.saturating_sub(then);
+    Some(if d < 60 {
+        "just now".to_string()
+    } else if d < 3600 {
+        format!("{}m ago", d / 60)
+    } else if d < 86_400 {
+        format!("{}h ago", d / 3600)
     } else {
-        format!("{secs}s")
-    }
+        format!("{}d ago", d / 86_400)
+    })
 }
 
-/// Render the status JSON as a fancy, panel-per-disk dashboard.
+/// One compact line summarizing a single disk, for rendering *inside* a source
+/// box. Leads with a power/mount glyph, then the disk name and the facts that
+/// matter at a glance: LUKS2 + TPM2 posture (with a ▲ lockout-risk flag),
+/// management verdict, and mount state. Truncated to the panel width by `Row`.
+fn disk_line(on: bool, d: &Value) -> String {
+    // A disabled disk is dormant — show it greyed with a distinct marker and skip
+    // the live power/mount facts (they don't apply while it's disabled).
+    let enabled = d.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    if !enabled {
+        let mut r = Row::new(on);
+        r.add("⊘ ", GREY);
+        r.add(&format!("{:<12} ", s(d, "name")), GREY);
+        r.add("disabled", YELLOW);
+        r.add("  (enable to manage)", GREY);
+        return r.finish();
+    }
+
+    let mounted = b(d, "mounted");
+    let powered = b(d, "powered");
+    let cold = s(d, "power_profile") == "cold-standby";
+    let (glyph, gcolor) = if mounted {
+        ("●", GREEN)
+    } else if powered {
+        ("◐", YELLOW)
+    } else if cold {
+        ("◌", CYAN)
+    } else {
+        ("○", GREY)
+    };
+
+    let luks2 = b(d, "luks2");
+    let tpm = b(d, "tpm2_token");
+    let fallback = b(d, "non_tpm_fallback");
+
+    let mut r = Row::new(on);
+    r.add(&format!("{glyph} "), gcolor);
+    r.add(&format!("{:<12} ", s(d, "name")), BOLD_CYAN);
+
+    if luks2 {
+        r.add("LUKS2", GREEN);
+    } else {
+        r.add("✗LUKS2", RED);
+    }
+    r.add("·", GREY);
+    if tpm {
+        r.add("TPM2", GREEN);
+    } else {
+        r.add("noTPM", GREY);
+    }
+    if luks2 && !fallback {
+        r.add(" ▲", YELLOW);
+    }
+
+    r.plain("  ");
+    let managed = d
+        .get("management")
+        .and_then(|m| m.get("managed"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let reason = d
+        .get("management")
+        .and_then(|m| m.get("reason"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    if managed {
+        r.add("managed", GREEN);
+    } else if reason == "remote-decrypt" {
+        r.add("forward-only", YELLOW);
+    } else {
+        r.add("foreign-key", YELLOW);
+    }
+
+    if mounted {
+        r.plain("  ");
+        r.add(&format!("→ {}", s(d, "mountpoint")), DIM);
+    }
+    r.finish()
+}
+
+/// Render the status JSON as a fancy dashboard — one box per *source* (this
+/// machine first, then each remote most-recently-connected first), with a
+/// compact line per disk inside.
 pub fn render_dashboard(value: &Value) -> String {
     let on = color_enabled();
     let paint = |t: &str, code: &str| -> String {
@@ -424,6 +535,7 @@ pub fn render_dashboard(value: &Value) -> String {
         }
     };
 
+    // -- footer counts, tallied once over every disk -----------------------
     let mut n_enc = 0;
     let mut n_auto = 0;
     let mut n_risk = 0;
@@ -431,177 +543,133 @@ pub fn render_dashboard(value: &Value) -> String {
     let mut n_remote = 0;
     let mut n_managed = 0;
     let mut n_unmanaged = 0;
-
     for d in disks {
-        let name = s(d, "name");
-        let profile = s(d, "power_profile");
-
-        // -- title: name + power profile -----------------------------------
-        let title_plain = format!("{name}  ·  {profile}");
-        let title_painted = format!(
-            "{}{}{}",
-            paint(name, &format!("{BOLD}{CYAN}")),
-            paint("  ·  ", GREY),
-            paint(profile, DIM),
-        );
-        out.push_str(&panel_top(&title_plain, &title_painted));
-
-        // -- identity ------------------------------------------------------
-        let device = s(d, "device");
-        let phys = s(d, "physical_device");
-        let mut r = Row::new(on);
-        r.add("device   ", GREY).plain(device);
-        if phys != device && phys != "?" {
-            r.add("  →  ", GREY).plain(phys);
-        }
-        out.push_str(&r.finish());
-
-        let mut r = Row::new(on);
-        r.add("uuid     ", GREY).plain(s(d, "uuid"));
-        r.add("   mapper ", GREY).plain(s(d, "mapper"));
-        out.push_str(&r.finish());
-
-        // -- remote host (the only place a disk's machine is surfaced) -------
-        if let Some(host) = d.get("host").and_then(|v| v.as_str()) {
-            n_remote += 1;
-            let mut r = Row::new(on);
-            r.add("remote   ", GREY);
-            r.add(&format!("⇄ {host}"), CYAN);
-            if let Some(rn) = d.get("remote").and_then(|v| v.as_str()) {
-                r.add(&format!("  [{rn}]"), DIM);
-            }
-            // How its ciphertext reaches this host (managed remote) vs forward-only.
-            if let Some(t) = d.get("transport").and_then(|v| v.as_str()) {
-                r.add(&format!("  ciphertext via {t}"), GREEN);
-            } else {
-                r.add("  forward-only", YELLOW);
-            }
-            out.push_str(&r.finish());
-        }
-
-        // -- encryption posture (the part tpmnt owns) ----------------------
-        let luks2 = b(d, "luks2");
-        let tpm = b(d, "tpm2_token");
-        let fallback = b(d, "non_tpm_fallback");
-        if luks2 {
+        if b(d, "luks2") {
             n_enc += 1;
         }
-        if tpm {
+        if b(d, "tpm2_token") {
             n_auto += 1;
         }
-        let mut r = Row::new(on);
-        r.add("crypto   ", GREY);
-        if luks2 {
-            r.add("● LUKS2", GREEN);
-        } else {
-            r.add("✗ not LUKS2", RED);
-        }
-        r.plain("   ");
-        if tpm {
-            r.add("● TPM2 auto-unlock", GREEN);
-        } else {
-            r.add("○ no TPM enroll", GREY);
-        }
-        r.plain("   ");
-        if !luks2 {
-            // fallback is meaningless without a container.
-            r.add("", "");
-        } else if fallback {
-            r.add(&format!("✓ {} keyslot(s)", u(d, "keyslots")), GREEN);
-        } else {
+        if b(d, "luks2") && !b(d, "non_tpm_fallback") {
             n_risk += 1;
-            r.add("▲ NO fallback key — lockout risk", YELLOW);
         }
-        out.push_str(&r.finish());
-
-        // -- management verdict (the threat-model boundary) ----------------
-        let managed = d
-            .get("management")
+        if b(d, "mounted") {
+            n_mounted += 1;
+        }
+        if d.get("host").and_then(|v| v.as_str()).is_some() {
+            n_remote += 1;
+        }
+        if d.get("management")
             .and_then(|m| m.get("managed"))
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let reason = d
-            .get("management")
-            .and_then(|m| m.get("reason"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        if managed {
+            .unwrap_or(false)
+        {
             n_managed += 1;
         } else {
             n_unmanaged += 1;
         }
-        let mut r = Row::new(on);
-        r.add("manage   ", GREY);
-        if managed {
-            r.add("● managed", GREEN);
-            r.add("  key local · decrypt local", DIM);
-        } else if reason == "remote-decrypt" {
-            r.add("⇄ forward-only", YELLOW);
-            r.add("  no ciphertext transport — tpmnt doesn't decrypt it", DIM);
-        } else {
-            r.add("○ unmanaged", YELLOW);
-            r.add("  foreign key — run `tpmnt adopt`", DIM);
-        }
-        out.push_str(&r.finish());
+    }
 
-        // -- system integration: crypttab + mount --------------------------
-        let mounted = b(d, "mounted");
-        if mounted {
-            n_mounted += 1;
-        }
-        let is_remote = d.get("host").and_then(|v| v.as_str()).is_some();
-        let mut r = Row::new(on);
-        r.add("system   ", GREY);
-        // crypttab is a local-management artifact; it doesn't apply to a disk
-        // whose crypttab lives on another machine.
-        if is_remote {
-            r.add("⇄ remote-managed", CYAN);
-        } else if b(d, "crypttab") {
-            r.add("✓ crypttab", GREEN);
+    // -- group disks by source: local (host null) vs each remote -----------
+    let mut local: Vec<&Value> = Vec::new();
+    let mut by_remote: std::collections::BTreeMap<&str, Vec<&Value>> =
+        std::collections::BTreeMap::new();
+    for d in disks {
+        if d.get("host").and_then(|v| v.as_str()).is_some() {
+            let rn = s(d, "remote");
+            by_remote.entry(rn).or_default().push(d);
         } else {
-            r.add("○ no crypttab", GREY);
+            local.push(d);
         }
-        r.plain("   ");
-        if mounted {
-            r.add(
-                &format!("✓ mounted {} ({})", s(d, "mountpoint"), s(d, "fstype")),
-                GREEN,
-            );
-        } else {
-            r.add(&format!("○ not mounted {}", s(d, "mountpoint")), GREY);
-        }
-        out.push_str(&r.finish());
+    }
 
-        // -- power / cold-standby ------------------------------------------
-        let powered = b(d, "powered");
-        let cold = profile == "cold-standby";
-        let mut r = Row::new(on);
-        r.add("power    ", GREY);
-        if powered {
-            r.add("● powered (mapper open)", GREEN);
-        } else if cold {
-            r.add("◌ spun-down (cold)", CYAN);
-        } else {
-            r.add("○ closed", GREY);
-        }
-        if cold {
-            r.plain("   ");
-            r.add(
-                &format!("standby {}", fmt_idle(u(d, "standby_timeout_secs"))),
-                DIM,
-            );
-            r.plain(" ");
-            // Monitoring is a local systemd unit; not tracked for remote disks.
-            if is_remote {
-                r.add("· remote", CYAN);
-            } else if b(d, "monitored") {
-                r.add("· monitored", GREEN);
-            } else {
-                r.add("· unmonitored", YELLOW);
-            }
-        }
-        out.push_str(&r.finish());
+    let now = value.get("now").and_then(|v| v.as_u64());
 
+    // -- box 1: always "self" (this machine), even if it holds no disks ------
+    let hostname = value
+        .get("env")
+        .and_then(|e| e.get("hostname"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("this machine");
+    let title_plain = format!("{hostname}  · local");
+    let title_painted = format!(
+        "{}{}",
+        paint(hostname, &format!("{BOLD}{CYAN}")),
+        paint("  · local", GREY),
+    );
+    out.push_str(&panel_top(&title_plain, &title_painted));
+    if local.is_empty() {
+        let mut r = Row::new(on);
+        r.add("(no local disks)", DIM);
+        out.push_str(&r.finish());
+    } else {
+        for d in &local {
+            out.push_str(&disk_line(on, d));
+        }
+    }
+    out.push_str(&panel_bottom());
+
+    // -- remaining boxes: remotes, most-recently-connected first -----------
+    let remote_meta = |name: &str| -> Option<&Value> {
+        value
+            .get("remotes")
+            .and_then(|v| v.as_array())
+            .and_then(|rs| {
+                rs.iter()
+                    .find(|r| r.get("name").and_then(|v| v.as_str()) == Some(name))
+            })
+    };
+    let last_of = |name: &str| -> Option<u64> {
+        remote_meta(name).and_then(|r| r.get("last_connected").and_then(|v| v.as_u64()))
+    };
+    let remote_enabled = |name: &str| -> bool {
+        remote_meta(name)
+            .and_then(|r| r.get("enabled").and_then(|v| v.as_bool()))
+            .unwrap_or(true)
+    };
+    let mut order: Vec<(&str, Option<u64>)> = by_remote.keys().map(|n| (*n, last_of(n))).collect();
+    // Newest connection first; never-connected (None) sink to the bottom; ties
+    // broken by name so the ordering is deterministic (and testable).
+    order.sort_by(|a, b| match (a.1, b.1) {
+        (Some(x), Some(y)) => y.cmp(&x).then(a.0.cmp(b.0)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.0.cmp(b.0),
+    });
+
+    for (name, last) in order {
+        let group = &by_remote[name];
+        let host = group
+            .first()
+            .and_then(|d| d.get("host").and_then(|v| v.as_str()))
+            .unwrap_or("?");
+        // A source is "connected" if any of its disks is currently up here; a
+        // disabled remote is called out so `up` skipping it makes sense.
+        let connected = group.iter().any(|d| b(d, "mounted") || b(d, "powered"));
+        let (state_glyph, state_word, state_color) = if !remote_enabled(name) {
+            ("⊘", "disabled", YELLOW)
+        } else if connected {
+            ("●", "connected", GREEN)
+        } else {
+            ("○", "idle", GREY)
+        };
+        let ago = fmt_ago(now, last);
+
+        let mut title_plain = format!("{name}  ⇄ {host}  {state_glyph} {state_word}");
+        let mut title_painted = format!(
+            "{}{}{}",
+            paint(name, &format!("{BOLD}{CYAN}")),
+            paint(&format!("  ⇄ {host}  "), GREY),
+            paint(&format!("{state_glyph} {state_word}"), state_color),
+        );
+        if let Some(a) = &ago {
+            title_plain.push_str(&format!("  · {a}"));
+            title_painted.push_str(&paint(&format!("  · {a}"), DIM));
+        }
+        out.push_str(&panel_top(&title_plain, &title_painted));
+        for d in group.iter() {
+            out.push_str(&disk_line(on, d));
+        }
         out.push_str(&panel_bottom());
     }
 
@@ -640,10 +708,13 @@ mod tests {
     fn sample() -> Value {
         json!({
             "env": {
+                "hostname": "nobara",
                 "distro_id": "fedora", "systemd_version": 255,
                 "tpm_rm_present": true, "tpm_path": "/dev/tpmrm0",
                 "initramfs": "dracut"
             },
+            "now": 1_000_000,
+            "remotes": [],
             "disks": [{
                 "name": "backup", "device": "/dev/disk/by-uuid/abcd",
                 "physical_device": "/dev/sdb", "mapper": "tpmnt-backup",
@@ -662,16 +733,31 @@ mod tests {
         })
     }
 
+    /// A minimal remote disk row for grouping/ordering tests.
+    fn remote_disk(name: &str, remote: &str, host: &str, up: bool) -> Value {
+        json!({
+            "name": name, "remote": remote, "host": host,
+            "uuid": "u", "mapper": "m", "fstype": "btrfs",
+            "luks2": true, "tpm2_token": true, "non_tpm_fallback": true,
+            "mountpoint": format!("/mnt/{name}"), "mounted": up, "powered": up,
+            "power_profile": "cold-standby",
+            "management": { "managed": true, "reason": "managed",
+                "detail": "", "local_key": true, "local_decrypt": true }
+        })
+    }
+
     #[test]
     fn dashboard_renders_key_fields_uncolored() {
         // Force the no-color path so the assertions are escape-free and stable.
         std::env::set_var("NO_COLOR", "1");
         let out = render_dashboard(&sample());
+        // The local box is titled with this machine's hostname.
+        assert!(out.contains("nobara"));
+        assert!(out.contains("· local"));
+        // The disk shows up as a compact line inside it.
         assert!(out.contains("backup"));
         assert!(out.contains("LUKS2"));
-        assert!(out.contains("TPM2 auto-unlock"));
-        assert!(out.contains("spun-down"));
-        assert!(out.contains("standby 10min"));
+        assert!(out.contains("TPM2"));
         assert!(out.contains("summary"));
         assert!(
             !out.contains('\x1b'),
@@ -698,21 +784,19 @@ mod tests {
     #[test]
     fn dashboard_shows_management_verdict_and_footer() {
         std::env::set_var("NO_COLOR", "1");
-        // Managed disk renders the managed row + footer count.
+        // Managed disk renders the managed tag + footer count.
         let out = render_dashboard(&sample());
-        assert!(out.contains("● managed"));
-        assert!(out.contains("key local · decrypt local"));
+        assert!(out.contains("managed"));
         assert!(out.contains("1 managed"));
 
-        // A foreign-key (unmanaged) disk points the operator at `adopt`.
+        // A foreign-key (unmanaged) disk is tagged as such and counted.
         let mut v = sample();
         v["disks"][0]["management"] = json!({
             "managed": false, "reason": "foreign-key", "detail": "",
             "local_key": false, "local_decrypt": true
         });
         let out = render_dashboard(&v);
-        assert!(out.contains("○ unmanaged"));
-        assert!(out.contains("tpmnt adopt"));
+        assert!(out.contains("foreign-key"));
         assert!(out.contains("1 unmanaged"));
     }
 
@@ -722,7 +806,8 @@ mod tests {
         let mut v = sample();
         v["disks"][0]["non_tpm_fallback"] = json!(false);
         let out = render_dashboard(&v);
-        assert!(out.contains("NO fallback key"));
+        // Compact line carries the ▲ risk marker; the footer tallies it.
+        assert!(out.contains('▲'));
         assert!(out.contains("without fallback key"));
     }
 
@@ -734,22 +819,83 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_surfaces_remote_host() {
+    fn dashboard_groups_remote_disks_under_a_source_box() {
         std::env::set_var("NO_COLOR", "1");
         let mut v = sample();
         v["disks"][0]["remote"] = json!("nas");
         v["disks"][0]["host"] = json!("alice@192.168.5.10");
-        // Local-only fields are null for a remote disk.
-        v["disks"][0]["crypttab"] = Value::Null;
-        v["disks"][0]["monitored"] = Value::Null;
+        v["remotes"] = json!([{ "name": "nas", "host": "alice@192.168.5.10",
+                                 "last_connected": 999_400 }]);
         let out = render_dashboard(&v);
-        // The host is shown (the one place a disk's machine is surfaced)…
-        assert!(out.contains("alice@192.168.5.10"));
-        assert!(out.contains("[nas]"));
-        // …crypttab reads as remote-managed, not a misleading "no crypttab"…
-        assert!(out.contains("remote-managed"));
-        assert!(!out.contains("no crypttab"));
-        // …and the footer counts it.
+        // The remote's own box carries the remote name + host in its title…
+        assert!(out.contains("nas"));
+        assert!(out.contains("⇄ alice@192.168.5.10"));
+        // …a relative "ago" from now (1_000_000) − last (999_400) = 600s = 10m…
+        assert!(out.contains("10m ago"), "{out}");
+        // …the disk still lists inside, and the footer counts it as remote.
+        assert!(out.contains("backup"));
         assert!(out.contains("1 remote"));
+    }
+
+    #[test]
+    fn dashboard_self_first_then_remotes_newest_connection_first() {
+        std::env::set_var("NO_COLOR", "1");
+        // One local disk, plus disks on two remotes with different recency.
+        let v = json!({
+            "env": { "hostname": "myhost" },
+            "now": 1_000_000,
+            "remotes": [
+                { "name": "attic", "host": "u@attic", "last_connected": 100 },
+                { "name": "shed",  "host": "u@shed",  "last_connected": 900_000 },
+            ],
+            "disks": [
+                json!({ "name": "here", "uuid": "u", "mapper": "m", "fstype": "xfs",
+                    "luks2": true, "tpm2_token": true, "non_tpm_fallback": true,
+                    "mountpoint": "/mnt/here", "mounted": true, "powered": true,
+                    "power_profile": "always-on",
+                    "management": { "managed": true, "reason": "managed", "detail": "",
+                        "local_key": true, "local_decrypt": true } }),
+                remote_disk("a", "attic", "u@attic", false),
+                remote_disk("s", "shed", "u@shed", true),
+            ]
+        });
+        let out = render_dashboard(&v);
+        let i_self = out.find("myhost").expect("self box");
+        let i_shed = out.find("shed").expect("shed box");
+        let i_attic = out.find("attic").expect("attic box");
+        // Self is always first; then remotes most-recently-connected first, so
+        // shed (900_000) precedes attic (100).
+        assert!(i_self < i_shed, "self must come first\n{out}");
+        assert!(i_shed < i_attic, "newer remote must precede older\n{out}");
+        // The connected remote reads "connected"; the idle one reads "idle".
+        assert!(out.contains("● connected"));
+        assert!(out.contains("○ idle"));
+    }
+
+    #[test]
+    fn dashboard_always_renders_self_box_even_with_no_local_disks() {
+        std::env::set_var("NO_COLOR", "1");
+        let v = json!({
+            "env": { "hostname": "myhost" },
+            "now": 1_000_000,
+            "remotes": [{ "name": "shed", "host": "u@shed", "last_connected": 900_000 }],
+            "disks": [ remote_disk("s", "shed", "u@shed", true) ]
+        });
+        let out = render_dashboard(&v);
+        let i_self = out.find("myhost").expect("self box present");
+        let i_shed = out.find("shed").expect("shed box");
+        assert!(i_self < i_shed, "self box first even when empty\n{out}");
+        assert!(out.contains("(no local disks)"));
+    }
+
+    #[test]
+    fn fmt_ago_buckets_by_magnitude() {
+        assert_eq!(fmt_ago(Some(1000), Some(999)).as_deref(), Some("just now"));
+        assert_eq!(fmt_ago(Some(1000), Some(400)).as_deref(), Some("10m ago"));
+        assert_eq!(fmt_ago(Some(10_000), Some(2800)).as_deref(), Some("2h ago"));
+        assert_eq!(fmt_ago(Some(200_000), Some(0)).as_deref(), Some("2d ago"));
+        // Missing either endpoint → no annotation.
+        assert_eq!(fmt_ago(None, Some(1)), None);
+        assert_eq!(fmt_ago(Some(1), None), None);
     }
 }

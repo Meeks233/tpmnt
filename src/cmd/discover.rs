@@ -46,11 +46,20 @@ fn relocate_inner(
     force_sweep: bool,
 ) -> Result<(Config, Vec<Value>)> {
     let dry = ctx.global.effective_dry_run();
-    let remotes = ctx.config.remotes.clone();
+    // Only enabled remotes are ever probed — a disabled remote is skipped so the
+    // discovery sweep never reaches out to it (part of avoiding reconnect storms).
+    let remotes: Vec<crate::config::Remote> = ctx
+        .config
+        .remotes
+        .iter()
+        .filter(|r| r.enabled)
+        .cloned()
+        .collect();
     let mut cfg = ctx.config.clone();
 
+    // A disabled disk is dormant: never relocated or probed for.
     let selected = |disk: &crate::config::Disk| -> bool {
-        names.is_none_or(|f| f.iter().any(|n| n == &disk.name))
+        disk.enabled && names.is_none_or(|f| f.iter().any(|n| n == &disk.name))
     };
 
     // One local probe covers the common case (a disk sits where the config says).

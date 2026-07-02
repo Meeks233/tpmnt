@@ -7,6 +7,9 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EnvInfo {
+    /// This machine's own hostname — titles the "self" box in the dashboard,
+    /// symmetric with the hostname-named remotes.
+    pub hostname: String,
     pub distro_id: String,
     pub systemd_version: Option<u32>,
     pub tpm_rm_present: bool,
@@ -30,6 +33,7 @@ pub enum Initramfs {
 impl EnvInfo {
     pub fn detect() -> EnvInfo {
         EnvInfo {
+            hostname: detect_hostname(),
             distro_id: detect_distro(),
             systemd_version: detect_systemd_version(),
             tpm_rm_present: Path::new("/dev/tpmrm0").exists(),
@@ -53,6 +57,20 @@ fn tpm_path() -> Option<String> {
         }
     }
     None
+}
+
+/// The live kernel hostname (what `hostname` prints), trimmed. Falls back to the
+/// static `/etc/hostname`, then "localhost".
+fn detect_hostname() -> String {
+    for p in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            let h = s.trim();
+            if !h.is_empty() {
+                return h.to_string();
+            }
+        }
+    }
+    "localhost".to_string()
 }
 
 fn detect_distro() -> String {

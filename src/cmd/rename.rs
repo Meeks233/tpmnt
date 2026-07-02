@@ -332,6 +332,7 @@ mod tests {
         let d = crate::config::Disk {
             name: "new".into(),
             uuid: "u".into(),
+            enabled: true,
             device: None,
             mapper: None,
             mountpoint: PathBuf::from("/mnt/new"),

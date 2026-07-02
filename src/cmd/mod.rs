@@ -6,6 +6,7 @@ pub mod adopt;
 pub mod apply;
 pub mod connect;
 pub mod destroy;
+pub mod detach;
 pub mod discover;
 pub mod enroll;
 pub mod init;
@@ -19,6 +20,7 @@ pub mod remote;
 pub mod rename;
 pub mod rollback;
 pub mod status;
+pub mod toggle;
 pub mod vault;
 
 use crate::cli::GlobalOpts;

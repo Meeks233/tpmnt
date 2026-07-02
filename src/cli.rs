@@ -68,6 +68,17 @@ pub enum Command {
     Offline(OfflineArgs),
     /// Permanently remove a disk's local management (needs --yes); no format.
     Destroy(DestroyArgs),
+    /// Enable disk(s): mark them managed again and bring them online (reconcile +
+    /// open + mount). Reverses `disable`. Omit names to multi-select.
+    Enable(ToggleArgs),
+    /// Disable disk(s): keep config + keys but stop managing them — unmount/close
+    /// now and remove crypttab/units so they never auto-unlock at boot. Reversible
+    /// with `enable`. Omit names to multi-select.
+    Disable(ToggleArgs),
+    /// Detach disk(s) from tpmnt into manual mode: enroll a passphrase you supply,
+    /// wipe tpmnt's TPM2 auto-unlock, and drop all local management. Data is kept;
+    /// you then unlock it yourself with that passphrase (+PIN).
+    Detach(DetachArgs),
     /// Take ownership of existing disk(s): rotate in a locally-managed key.
     Adopt(AdoptArgs),
     /// Rename a disk's logical (mount) name; re-points crypttab/fstab and, if the
@@ -83,7 +94,8 @@ pub enum Command {
     Discover(DiscoverArgs),
     /// Pull disk(s) online on demand: try each at its last-known endpoint first,
     /// and only fall back to a single global discovery sweep if that endpoint
-    /// doesn't answer (never a per-remote storm). Default: all disks, or name some.
+    /// doesn't answer (never a per-remote storm). Default: all disks, name some,
+    /// or `--remote <name>` to bring up exactly the disks present on one remote now.
     #[command(alias = "up")]
     Connect(ConnectArgs),
     /// Report per-disk LUKS2/token/crypttab/mount state.
@@ -96,7 +108,8 @@ pub enum Command {
     Migrate(MigrateArgs),
     /// Restore a backed-up header and revert config edits for a device.
     Rollback(RollbackArgs),
-    /// List the SSH remotes this machine controls and the disks on each.
+    /// List the SSH remotes this machine controls (default), or `remote add
+    /// <host>` to register a new one (its name defaults to the remote's hostname).
     Remote(RemoteArgs),
     /// Client-side: mount a remote tpmnt-managed dir over sshfs (+ ProxyJump).
     #[command(alias = "client")]
@@ -258,9 +271,55 @@ pub struct OfflineArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct ToggleArgs {
+    /// Name(s) of the [[disk]] entries to act on. Omit to pick from a
+    /// multi-select list in an interactive terminal.
+    pub names: Vec<String>,
+    /// Lazily detach a busy mount (`umount -l`) when disabling.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DetachArgs {
+    /// Name(s) of the [[disk]] entries to detach into manual mode. Omit to pick
+    /// from a multi-select list in an interactive terminal.
+    pub names: Vec<String>,
+
+    /// Read the NEW manual passphrase (that you'll unlock the disk with after
+    /// detaching) from this file. Otherwise $PASSWORD or an interactive prompt.
+    #[arg(long)]
+    pub passphrase_file: Option<PathBuf>,
+    /// Read the new manual passphrase from stdin.
+    #[arg(long)]
+    pub passphrase_stdin: bool,
+
+    /// Also add a TPM2+PIN keyslot so the disk can be unlocked by TPM2+PIN in
+    /// addition to the manual passphrase (still not tpmnt-managed).
+    #[arg(long)]
+    pub with_pin: bool,
+
+    /// Keep tpmnt's existing TPM2 auto-unlock token instead of wiping it (default
+    /// is to wipe it so the disk truly requires your manual passphrase).
+    #[arg(long)]
+    pub keep_tpm: bool,
+
+    /// Lazily detach a busy mount (`umount -l`) during teardown.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Local port for the NBD-over-SSH tunnel when a remote disk's ciphertext must
+    /// be forwarded here to re-enroll its header.
+    #[arg(long, default_value_t = 21813)]
+    pub local_port: u16,
+}
+
+#[derive(Args, Debug)]
 pub struct DestroyArgs {
-    /// Name of the [[disk]] to stop managing. Confirm with the global --yes.
-    pub name: String,
+    /// Name(s) of the [[disk]] entries to stop managing. Omit to pick from a
+    /// multi-select list in an interactive terminal. Confirm with the global
+    /// --yes (or answer the interactive prompt).
+    pub names: Vec<String>,
     /// Lazily detach a busy mount (`umount -l`) during teardown.
     #[arg(long)]
     pub force: bool,
@@ -396,8 +455,16 @@ pub struct DiscoverArgs {
 
 #[derive(Args, Debug)]
 pub struct ConnectArgs {
-    /// Disks to bring online (default: every configured disk).
+    /// Disks to bring online (default: every configured disk). With --remote, this
+    /// narrows the action to a subset of that remote's disks instead.
     pub names: Vec<String>,
+
+    /// Bring up the disks that live on this [[remote]]: probe the remote once and
+    /// connect exactly the configured disks actually present there now, silently
+    /// skipping any that have since been removed (the "was abc, now acd → bring up
+    /// ac" case). Scoped to this one remote — never a network-wide sweep.
+    #[arg(long)]
+    pub remote: Option<String>,
 
     /// Base local port for the NBD-over-SSH ciphertext forward. Each remote disk
     /// connected in one run uses a distinct port counting up from this.
@@ -407,11 +474,73 @@ pub struct ConnectArgs {
 
 #[derive(Args, Debug)]
 pub struct RemoteArgs {
+    #[command(subcommand)]
+    pub action: Option<RemoteAction>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RemoteAction {
+    /// List configured remotes and the disks on each (this is the default when no
+    /// subcommand is given).
+    List(RemoteListArgs),
+    /// Register a new SSH remote. Its name defaults to the hostname the remote
+    /// itself reports (via `ssh <host> hostname`), so `tpmnt up --remote <hostname>`
+    /// just works; override with --name.
+    Add(RemoteAddArgs),
+    /// Remove SSH remote(s) from the config. Omit names to pick from a
+    /// multi-select list. Refuses a remote that still has disks (destroy/move
+    /// them first, so they aren't orphaned).
+    #[command(alias = "rm", alias = "delete")]
+    Remove(RemoteRemoveArgs),
+    /// Enable remote(s): `up`/discovery consider their disks again. Reverses
+    /// `disable`. Omit names to multi-select.
+    Enable(RemoteToggleArgs),
+    /// Disable remote(s): `up`/discovery skip their disks (no probing/connecting),
+    /// and the dashboard greys them out. Reversible with `enable`. Omit names to
+    /// multi-select.
+    Disable(RemoteToggleArgs),
+}
+
+#[derive(Args, Debug, Default)]
+pub struct RemoteListArgs {
     /// Only show this named remote (default: all).
     pub name: Option<String>,
     /// Probe each remote over SSH and report reachability (adds a round-trip).
     #[arg(long)]
     pub probe: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct RemoteAddArgs {
+    /// SSH destination: user@addr[:port].
+    pub host: String,
+
+    /// Logical name for the remote, referenced by `disk.remote` and `up --remote`.
+    /// Default: the hostname the remote reports over SSH.
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Jump/bastion host(s): user@host[:port]. Repeatable or comma-separated.
+    #[arg(long = "jump", alias = "proxy-jump")]
+    pub jump: Vec<String>,
+
+    /// SSH identity (private key) file.
+    #[arg(long)]
+    pub identity: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct RemoteRemoveArgs {
+    /// Name(s) of the [[remote]] entries to remove. Omit to pick from a
+    /// multi-select list in an interactive terminal.
+    pub names: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct RemoteToggleArgs {
+    /// Name(s) of the [[remote]] entries to enable/disable. Omit to pick from a
+    /// multi-select list in an interactive terminal.
+    pub names: Vec<String>,
 }
 
 #[derive(Args, Debug)]

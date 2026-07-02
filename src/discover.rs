@@ -206,6 +206,7 @@ mod tests {
         Disk {
             name: name.into(),
             uuid: "u-123".into(),
+            enabled: true,
             device: None,
             mapper: None,
             mountpoint: PathBuf::from(format!("/mnt/{name}")),

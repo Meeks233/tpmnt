@@ -363,6 +363,7 @@ pub fn run(ctx: &Context, args: &InitArgs) -> Result<Value> {
         let disk = Disk {
             name: r.name.clone(),
             uuid: luks_uuid.clone(),
+            enabled: true,
             device: Some(rec_device),
             mapper: None,
             mountpoint: r.mountpoint.clone(),

@@ -22,17 +22,42 @@ use super::offline::{detach, find_disk};
 use super::Context;
 
 pub fn run(ctx: &Context, args: &DestroyArgs) -> Result<Value> {
-    let disk = find_disk(ctx, &args.name)?.clone();
     let dry = ctx.global.effective_dry_run();
+    let interactive = crate::tui::interactive(ctx.global.non_interactive);
 
-    // Confirmation gate — required even for AI/automation.
-    if !ctx.global.yes {
+    // Resolve the target disk names: explicit on the CLI, or an interactive
+    // multi-select when none were named.
+    let targets = resolve_targets(ctx, &args.names, interactive)?;
+    if targets.is_empty() {
+        return Ok(json!({
+            "ok": true, "action": "destroy", "dry_run": dry,
+            "destroyed": [], "note": "nothing selected",
+        }));
+    }
+
+    // Validate every name up front (fail before touching anything).
+    let disks: Vec<_> = targets
+        .iter()
+        .map(|n| find_disk(ctx, n).cloned())
+        .collect::<Result<Vec<_>>>()?;
+
+    // Confirmation gate — required even for AI/automation. Satisfied by --yes, or
+    // an explicit interactive y/N (the multi-select alone isn't taken as consent).
+    let confirmed = ctx.global.yes
+        || (interactive
+            && crate::tui::confirm(&format!(
+                "Permanently remove tpmnt's local management of {} disk(s): {}? \
+                 (data stays encrypted, NOT wiped) [y/N] ",
+                disks.len(),
+                targets.join(", "),
+            ))?);
+    if !confirmed {
         return Err(Error::new(
             Code::EConfirmationRequired,
             format!(
-                "destroy permanently removes tpmnt's local management of {:?} \
+                "destroy permanently removes tpmnt's local management of {} disk(s) \
                  (config, crypttab/fstab, units, key bundles)",
-                disk.name
+                disks.len()
             ),
         )
         .with_hint(
@@ -40,6 +65,65 @@ pub fn run(ctx: &Context, args: &DestroyArgs) -> Result<Value> {
         ));
     }
 
+    let mut destroyed = Vec::new();
+    for disk in &disks {
+        destroyed.push(destroy_one(ctx, disk, args.force, dry)?);
+    }
+    Ok(json!({
+        "ok": true,
+        "action": "destroy",
+        "dry_run": dry,
+        "formatted": false,
+        "destroyed": destroyed,
+    }))
+}
+
+/// Turn CLI names (or, when none given, an interactive multi-select) into the
+/// list of disk names to destroy. A non-interactive run with no names is an
+/// error; an interactive run with no disks configured yields an empty list.
+fn resolve_targets(ctx: &Context, names: &[String], interactive: bool) -> Result<Vec<String>> {
+    if !names.is_empty() {
+        return Ok(names.to_vec());
+    }
+    if !interactive {
+        return Err(
+            Error::new(Code::EConfig, "no disk named to destroy".to_string()).with_hint(
+                "name the disk(s) to destroy, or run in an interactive terminal to multi-select",
+            ),
+        );
+    }
+    let items: Vec<crate::tui::Item> = ctx
+        .config
+        .disks
+        .iter()
+        .map(|d| {
+            let where_ = d
+                .remote
+                .as_deref()
+                .map(|r| format!("remote {r}"))
+                .unwrap_or_else(|| "local".to_string());
+            crate::tui::Item::new(
+                d.name.clone(),
+                format!("{}  [{}]", d.mountpoint.display(), where_),
+            )
+        })
+        .collect();
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let chosen = crate::tui::multiselect(
+        "Select disk(s) to destroy — removes tpmnt management only; data stays encrypted:",
+        &items,
+    )?;
+    Ok(chosen
+        .into_iter()
+        .map(|i| ctx.config.disks[i].name.clone())
+        .collect())
+}
+
+/// Purge every local artifact for a single disk (detach + files + crypttab/fstab
+/// + mountpoint + config entry). Returns a per-disk result object.
+fn destroy_one(ctx: &Context, disk: &crate::config::Disk, force: bool, dry: bool) -> Result<Value> {
     // Warn if we're about to delete the only copy of the key.
     let dir = &ctx.config.defaults.key_backup;
     let has_offline_escrow = ["age", "asc", "enc"]
@@ -55,23 +139,39 @@ pub fn run(ctx: &Context, args: &DestroyArgs) -> Result<Value> {
     }
 
     // 1. Detach (grace unmount + close) on the disk's host.
-    let steps = detach(ctx, &disk, args.force)?;
+    let steps = detach(ctx, disk, force)?;
 
-    // 2. Purge every local artifact tied to this disk.
+    // 2. Purge every local artifact tied to this disk (units, key bundles,
+    //    crypttab/fstab, mountpoint, config entry).
+    let mut result = purge_local_footprint(ctx, disk, dry)?;
+    result["detach_steps"] = json!(steps);
+    result["warnings"] = json!(warnings);
+    Ok(result)
+}
+
+/// Remove every local artifact tied to `disk`: systemd units, all key bundles
+/// (sealed, plaintext, escrow), the header backup, monitor/schedule state, the
+/// crypttab/fstab lines, the (empty) mountpoint dir, and the `[[disk]]` config
+/// entry. Shared by `destroy` (retire the disk) and `detach` (hand it to manual
+/// mode) — neither touches the LUKS data itself. Returns a per-disk result object.
+pub(crate) fn purge_local_footprint(
+    ctx: &Context,
+    disk: &crate::config::Disk,
+    dry: bool,
+) -> Result<Value> {
+    let dir = &ctx.config.defaults.key_backup;
     let mut purged: Vec<Value> = Vec::new();
 
-    // 2a. Stop+disable and remove systemd units.
+    // Stop+disable and remove systemd units.
     let unit_dir = ctx.paths.systemd_unit_dir();
-    let mount_unit = reconcile::unit_name_for(&disk.mountpoint);
     let units = [
-        mount_unit,
+        reconcile::unit_name_for(&disk.mountpoint),
         format!("tpmnt-monitor-{}.service", disk.name),
         format!("tpmnt-schedule-{}.service", disk.name),
     ];
     for unit in &units {
         let path = unit_dir.join(unit);
         if path.exists() {
-            // Best-effort stop+disable so systemd stops restarting it.
             let _ = ctx.runner.run(
                 &["systemctl", "disable", "--now", unit],
                 "stop+disable disk unit before removal",
@@ -80,41 +180,69 @@ pub fn run(ctx: &Context, args: &DestroyArgs) -> Result<Value> {
         purged.push(remove_file(&path, dry));
     }
 
-    // 2b. Key bundles (sealed + plaintext + escrow copies).
+    // Key bundles (sealed + plaintext + escrow copies).
     for ext in ["cred", "json", "age", "asc", "enc"] {
         purged.push(remove_file(&dir.join(format!("{}.{ext}", disk.name)), dry));
     }
 
-    // 2c. Header backup + monitor/schedule state.
+    // Header backup + monitor/schedule state.
     purged.push(remove_file(&ctx.paths.header_backup(&disk.uuid), dry));
     purged.push(remove_file(&ctx.paths.monitor_state(&disk.name), dry));
     purged.push(remove_file(&ctx.paths.schedule_state(&disk.name), dry));
 
-    // 2d. crypttab / fstab tagged lines.
     let crypttab = reconcile::remove_tagged_line(&ctx.paths.crypttab(), &disk.name, dry)?;
     let fstab = reconcile::remove_tagged_line(&ctx.paths.fstab(), &disk.name, dry)?;
-
-    // 2e. The mountpoint dir, if now empty.
     let mp_removed = remove_empty_dir(&disk.mountpoint, dry);
-
-    // 2f. The [[disk]] entry in the config.
     let config_removed = remove_from_config(ctx, &disk.name, dry)?;
 
     Ok(json!({
-        "ok": true,
-        "action": "destroy",
         "name": disk.name,
         "remote": disk.remote,
-        "dry_run": dry,
-        "formatted": false,
-        "detach_steps": steps,
         "purged": purged,
         "crypttab": crypttab,
         "fstab": fstab,
         "mountpoint_removed": mp_removed,
         "config_removed": config_removed,
-        "warnings": warnings,
     }))
+}
+
+/// Human rendering: one line per destroyed disk, plus any key-loss warnings.
+pub fn render(value: &Value) -> String {
+    let dry = value.get("dry_run").and_then(|v| v.as_bool()) == Some(true);
+    let mut out = String::new();
+    out.push_str(if dry {
+        "destroy (dry-run):\n"
+    } else {
+        "destroy:\n"
+    });
+    match value.get("destroyed").and_then(|v| v.as_array()) {
+        Some(ds) if !ds.is_empty() => {
+            for d in ds {
+                let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let cfg = d
+                    .get("config_removed")
+                    .and_then(|c| c.get("action"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                out.push_str(&format!(
+                    "  ✓ {name}: local management removed (config {cfg}, data left encrypted)\n"
+                ));
+                if let Some(ws) = d.get("warnings").and_then(|v| v.as_array()) {
+                    for w in ws.iter().filter_map(|v| v.as_str()) {
+                        out.push_str(&format!("      ⚠ {w}\n"));
+                    }
+                }
+            }
+        }
+        _ => {
+            let note = value
+                .get("note")
+                .and_then(|v| v.as_str())
+                .unwrap_or("nothing destroyed");
+            out.push_str(&format!("  ({note})\n"));
+        }
+    }
+    out
 }
 
 /// Remove a file, reporting the action. A missing file is a noop.

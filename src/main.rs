@@ -15,7 +15,9 @@ mod paths;
 mod pin;
 mod power;
 mod reconcile;
+mod remote_state;
 mod secret;
+mod tui;
 mod vault;
 
 use std::process::ExitCode;
@@ -63,6 +65,9 @@ fn main() -> ExitCode {
         Command::Recover(a) => cmd::recover::run(&ctx, a),
         Command::Offline(a) => cmd::offline::run(&ctx, a),
         Command::Destroy(a) => cmd::destroy::run(&ctx, a),
+        Command::Enable(a) => cmd::toggle::enable(&ctx, a),
+        Command::Disable(a) => cmd::toggle::disable(&ctx, a),
+        Command::Detach(a) => cmd::detach::run(&ctx, a),
         Command::Enroll(a) => cmd::enroll::run(&ctx, a),
         Command::Apply => cmd::apply::run(&ctx),
         Command::Connect(a) => cmd::connect::run(&ctx, a),
@@ -113,6 +118,9 @@ fn render_human(command: &Command, value: &Value) {
         Command::Rename(_) => print!("{}", cmd::rename::render(value)),
         Command::Recover(_) => print!("{}", cmd::recover::render(value)),
         Command::Connect(_) => print!("{}", cmd::connect::render(value)),
+        Command::Destroy(_) => print!("{}", cmd::destroy::render(value)),
+        Command::Enable(_) | Command::Disable(_) => print!("{}", cmd::toggle::render(value)),
+        Command::Detach(_) => print!("{}", cmd::detach::render(value)),
         Command::Discover(_) => print!("{}", cmd::discover::render(value)),
         Command::Pin(_) => print!("{}", cmd::pin::render(value)),
         Command::Vault(_) => print!("{}", cmd::vault::render(value)),

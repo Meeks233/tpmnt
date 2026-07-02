@@ -86,6 +86,13 @@ pub struct Disk {
     pub name: String,
     /// LUKS container UUID (from `cryptsetup luksUUID`).
     pub uuid: String,
+    /// Management state. A `disabled` disk stays in the config and keeps its key
+    /// bundle, but tpmnt actively skips it: `apply` removes its crypttab/fstab/
+    /// units (so it never auto-unlocks at boot) and `up`/discovery pass it over.
+    /// `tpmnt enable <name>` restores it; `tpmnt disable <name>` (or three failed
+    /// reconnects) sets it false. Absent in the TOML means enabled.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
     /// Optional explicit device path. When unset, the container is located via
     /// /dev/disk/by-uuid/<uuid>. Useful for stable by-id paths or loop devices.
     #[serde(default)]
@@ -188,6 +195,12 @@ impl Transport {
 pub struct Remote {
     /// Stable name referenced by `disk.remote`.
     pub name: String,
+    /// Management state. A `disabled` remote stays registered but tpmnt skips it:
+    /// `up`/discovery never probe or connect its disks and the dashboard greys it
+    /// out. Set false by `tpmnt remote disable`, or automatically after three
+    /// consecutive failed reconnects. Absent in the TOML means enabled.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
     /// SSH destination: user@addr[:port].
     pub host: String,
     /// Optional jump/bastion host(s): user@host[:port]. Comma-separated or
@@ -520,6 +533,12 @@ fn default_standby_timeout() -> String {
 fn default_true() -> bool {
     true
 }
+/// Skip serializing a `true` flag so an enabled disk/remote stays absent from the
+/// TOML (only the notable `enabled = false` is ever written).
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
+fn is_true(b: &bool) -> bool {
+    *b
+}
 
 impl Config {
     /// Load config from disk. A missing file yields an empty default config so
@@ -771,6 +790,42 @@ mountpoint = "/mnt/d"
     }
 
     #[test]
+    fn enabled_defaults_true_and_only_false_serializes() {
+        // Absent `enabled` reads as enabled, for both disks and remotes.
+        let cfg: Config = toml::from_str(
+            r#"
+[[remote]]
+name = "nas"
+host = "u@nas"
+
+[[disk]]
+name = "d"
+uuid = "u"
+mountpoint = "/mnt/d"
+
+[[disk]]
+name = "off"
+uuid = "u2"
+mountpoint = "/mnt/off"
+enabled = false
+"#,
+        )
+        .unwrap();
+        assert!(cfg.remotes[0].enabled, "remote defaults enabled");
+        assert!(cfg.disks[0].enabled, "disk defaults enabled");
+        assert!(!cfg.disks[1].enabled, "explicit false honored");
+
+        // Round-trip: enabled=true stays out of the TOML; enabled=false is written.
+        let toml = cfg.to_toml();
+        let disabled_lines = toml.matches("enabled = false").count();
+        assert_eq!(
+            disabled_lines, 1,
+            "only the disabled disk emits the flag:\n{toml}"
+        );
+        assert!(!toml.contains("enabled = true"), "true is skipped:\n{toml}");
+    }
+
+    #[test]
     fn multi_remote_registry_and_disk_association() {
         let cfg: Config = toml::from_str(
             r#"
@@ -883,6 +938,7 @@ transport = "nvme-tcp"
     fn plain_remote_no_jump_no_identity() {
         let r = Remote {
             name: "nas".into(),
+            enabled: true,
             host: "alice@192.168.5.10".into(),
             jump: vec![],
             identity: None,
