@@ -12,3 +12,10 @@ git_tag_name = "v{{ version }}"
 # release.yml owns the GitHub Release (it attaches the .deb/.rpm/SHA256SUMS assets).
 # release-plz only creates the tag; it must not create a competing empty release.
 git_release_enable = false
+
+# Only cut a release when a feat/fix (or breaking feat!/fix!) commit has landed.
+# Housekeeping-only pushes (ci:/docs:/chore:/refactor:/test:) must NOT spawn a
+# release PR — otherwise the commit-on-acceptance loop would churn out pointless
+# version bumps. `[(!:]` also matches breaking changes (`feat!:`); the docs' `[(:]`
+# example omits `!` and would skip them.
+release_commits = "^(feat|fix)[(!:]"
