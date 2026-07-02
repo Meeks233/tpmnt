@@ -4,6 +4,20 @@ All notable changes to tpmnt are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.2](https://github.com/Meeks233/tpmnt/compare/v0.3.1...v0.3.2) - 2026-07-02
+
+### Added
+
+- *(init/adopt)* default mountpoint /mnt/<name>-<uuid4> so same-named disks don't collide under /mnt
+- *(remote)* add 'remote rename' (re-points disks + moves state); clarify mountpoints are stable & location-independent
+- disk/remote state model (enable/disable/destroy/detach + remote add/remove), up --remote, grouped dashboard, TUI multi-select, auto-disable on reconnect storms
+
+### Other
+
+- automate version bumps + releases with release-plz
+- “fix:
+- warn when non-root instead of misreporting disks
+
 ## [0.3.1] - 2026-07-02
 
 ### Added

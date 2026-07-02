@@ -1,6 +1,6 @@
 [package]
 name = "tpmnt"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Unified, declarative, AI-native CLI for LUKS2 + TPM2 enroll-once auto-decrypt and auto-mount"
 license = "MIT OR Apache-2.0"
